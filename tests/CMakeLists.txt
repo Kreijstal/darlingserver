@@ -49,6 +49,7 @@ dserver_host_test(prefix_setup TEMP_DIR SOURCES ${host}/prefix_setup_test.cpp ${
 
 # the run mode decision (root, user namespace, no privileges) and the libexec override rule
 dserver_host_test(run_mode SOURCES ${host}/run_mode_test.cpp ${root}/src/run-mode.cpp)
+dserver_host_test(mldr_path SOURCES ${host}/mldr_path_test.cpp ${root}/src/run-mode.cpp)
 
 # tests that compile real functions cut out of a source file
 

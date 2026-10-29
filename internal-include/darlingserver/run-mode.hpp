@@ -92,6 +92,8 @@ namespace DarlingServer::RunMode {
 	// ".." components; otherwise the directory compiled in is used. Returns false, with the reason in
 	// error, if an override is honoured but is not valid.
 	bool resolveLibexecPath(Mode mode, const char* override, std::string& path, std::string& error);
+	// Same privilege/path rule for the native loader, selected once before threads start.
+	bool resolveMldrPath(Mode mode, const std::string& libexec, const char* override, std::string& path, std::string& error);
 };
 
 #endif // _DARLINGSERVER_RUN_MODE_HPP_

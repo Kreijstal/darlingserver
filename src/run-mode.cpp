@@ -150,8 +150,8 @@ Mode detect(uid_t uid, gid_t gid) {
 	return classify(facts);
 }
 
-bool resolveLibexecPath(Mode mode, const char* override, std::string& path, std::string& error) {
-	path = LIBEXEC_PATH;
+static bool resolveHostPath(Mode mode, const char* setting, const std::string& fallback, const char* override, std::string& path, std::string& error) {
+	path = fallback;
 	if (mode == Mode::Root || !override || !override[0]) {
 		return true;
 	}
@@ -175,7 +175,7 @@ bool resolveLibexecPath(Mode mode, const char* override, std::string& path, std:
 		}
 	}
 	if (!valid) {
-		error = "DARLING_LIBEXEC_PATH must be an absolute path without control characters or . and .. components";
+		error = std::string(setting) + " must be an absolute path without control characters or . and .. components";
 		return false;
 	}
 
@@ -184,6 +184,15 @@ bool resolveLibexecPath(Mode mode, const char* override, std::string& path, std:
 		path.pop_back();
 	}
 	return true;
+}
+
+
+bool resolveLibexecPath(Mode mode, const char* override, std::string& path, std::string& error) {
+	return resolveHostPath(mode, "DARLING_LIBEXEC_PATH", LIBEXEC_PATH, override, path, error);
+}
+
+bool resolveMldrPath(Mode mode, const std::string& libexec, const char* override, std::string& path, std::string& error) {
+	return resolveHostPath(mode, "DARLING_MLDR_PATH", libexec + "/usr/libexec/darling/mldr", override, path, error);
 }
 
 };

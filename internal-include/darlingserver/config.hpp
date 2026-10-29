@@ -25,8 +25,17 @@ namespace DarlingServer {
 			libexecPathStorage() = std::move(path);
 		};
 
+		inline std::string& mldrPathStorage() {
+			static std::string path;
+			return path;
+		};
+
+		inline void setMldrPath(std::string path) {
+			mldrPathStorage() = std::move(path);
+		};
+
 		inline std::string defaultMldrPath() {
-			return libexecPath() + "/usr/libexec/darling/mldr";
+			return mldrPathStorage().empty() ? libexecPath() + "/usr/libexec/darling/mldr" : mldrPathStorage();
 		};
 
 		// this would actually probably be better as a workqueue construction parameter

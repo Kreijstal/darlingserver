@@ -952,6 +952,10 @@ int main(int argc, char** argv) {
 	int pipefd = -1;
 	bool fix_permissions = false;
 	pid_t launchdGlobalPID = -1;
+
+	// The launcher recognizes a running server by its name, and in an Android
+	// app this file is libdarlingserver.so.
+	prctl(PR_SET_NAME, "darlingserver", 0, 0, 0);
 	struct rlimit default_limit;
 	struct rlimit increased_limit;
 	FILE* nr_open_file = NULL;
@@ -1004,6 +1008,13 @@ int main(int argc, char** argv) {
 		}
 		DarlingServer::Config::setLibexecPath(libexec);
 		unsetenv("DARLING_LIBEXEC_PATH");
+		std::string mldr, mldrError;
+		if (!DarlingServer::RunMode::resolveMldrPath(runMode, libexec, getenv("DARLING_MLDR_PATH"), mldr, mldrError)) {
+			fprintf(stderr, "darlingserver: %s\n", mldrError.c_str());
+			exit(1);
+		}
+		DarlingServer::Config::setMldrPath(mldr);
+		unsetenv("DARLING_MLDR_PATH");
 	}
 
 	// The ids that own the user's files as this process sees them. In a user namespace the launcher
