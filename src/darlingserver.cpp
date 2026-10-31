@@ -186,6 +186,17 @@ void setupUserHome(const char* prefix, uid_t originalUID)
 		unlink(buf);
 		symlink(buf2, buf);
 	}
+
+	// Home setup already runs after dropping privileges permanently. Populate
+	// missing template files through pinned directories without following XDG links.
+	snprintf(buf, sizeof(buf), "%s/Users/%s", prefix, login);
+	std::string userTemplate = DarlingServer::Config::libexecPath() + "/System/Library/User Template";
+	int templateFd = open(userTemplate.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	int homeFd = open(buf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (templateFd >= 0 && homeFd >= 0)
+		DarlingServer::PrefixSetup::fillMissingTree(templateFd, homeFd);
+	if (templateFd >= 0) close(templateFd);
+	if (homeFd >= 0) close(homeFd);
 }
 
 void setupCoredumpPattern(void)

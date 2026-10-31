@@ -237,7 +237,7 @@ static void testCopy() {
 		std::perror("link");
 		std::exit(2);
 	}
-	makeLink("../outside", "c/upper/redirected", 2000);
+	makeLink("../outside", "c/upper/redirected", 4102444800);
 	makeLink("../outside/victim", "c/upper/through-link", 1000);
 	mkdirs("c/upper/kind");
 

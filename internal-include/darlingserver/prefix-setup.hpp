@@ -62,7 +62,8 @@ namespace DarlingServer::PrefixSetup {
 
 	// Copies the tree below lowerFd into upperFd (the copy mode). A file or symbolic link replaces an
 	// older one of the same kind, gets the attributes of the lower one when both have the same
-	// modification time, and is left alone when it is newer or of a different kind. A new directory
+	// modification time, and is left alone when it is newer or of a different kind, except an older link
+	// replaced by a newer image directory. A new directory
 	// gets the lower directory's owner, mode and times.
 	//
 	// The upper tree may be changed by its owner while this runs as root, so every step works on a
@@ -76,6 +77,10 @@ namespace DarlingServer::PrefixSetup {
 	// cannot be set: the copy then belongs to its maker, and the set-ID bits, which would name that user
 	// instead of the lower owner, are dropped.
 	bool copyTree(int lowerFd, int upperFd, bool giveLowerOwners = true);
+
+	// Fill only missing home-template files. Run before threads, as the user;
+	// preserve existing entries and never traverse source or destination links.
+	bool fillMissingTree(int lowerFd, int upperFd);
 
 	// Looks up one of the user's directories (name is "DOWNLOAD", "MUSIC" and so on) in the contents
 	// of an xdg-user-dirs configuration file, user-dirs.dirs. Its lines have the form

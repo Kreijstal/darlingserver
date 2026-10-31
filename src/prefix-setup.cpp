@@ -395,6 +395,15 @@ bool copyEntry(int lowerFd, int upperFd, const char* name, const std::string& pa
 	}
 
 	if (S_ISDIR(from.st_mode)) {
+		// An updated image may replace an old link (such as zoneinfo) with
+		// an owned directory. Remove only the link itself, never its target.
+		if (exists && S_ISLNK(to.st_mode) && compareTimespec(from.st_mtim, to.st_mtim) > 0) {
+			if (unlinkat(upperFd, name, 0) != 0) {
+				if (changedMeanwhile(errno)) return true;
+				return failed("remove the old link", path);
+			}
+			exists = false;
+		}
 		if (exists && !S_ISDIR(to.st_mode)) {
 			return true;
 		}
@@ -446,6 +455,51 @@ bool copyBelow(int lowerFd, int upperFd, const std::string& path) {
 	return true;
 }
 
+
+// Missing-only user-home population: existing files and symbolic links are
+// never replaced, and recursion enters only pinned, non-symlink directories.
+bool fillMissingBelow(int lowerFd, int upperFd, const std::string& path) {
+	DirList lower(lowerFd);
+	if (!lower.ok()) return failed("read", path);
+	while (const char* name = lower.next()) {
+		struct stat from, to;
+		const std::string child = join(path, name);
+		if (fstatat(lower.fd(), name, &from, AT_SYMLINK_NOFOLLOW) != 0)
+			return failed("read", child);
+		bool exists = fstatat(upperFd, name, &to, AT_SYMLINK_NOFOLLOW) == 0;
+		if (!exists && errno != ENOENT) return failed("look at", child);
+		if (S_ISDIR(from.st_mode)) {
+			if (exists && !S_ISDIR(to.st_mode)) continue;
+			bool created = false;
+			if (!exists) {
+				created = mkdirat(upperFd, name, 0700) == 0;
+				if (!created && errno != EEXIST) return failed("create", child);
+			}
+			Fd destination(openat(upperFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+			if (!destination.ok()) {
+				if (changedMeanwhile(errno)) continue;
+				return failed("open", child);
+			}
+			Fd source(openat(lower.fd(), name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+			if (!source.ok()) return failed("read", child);
+			if (!fillMissingBelow(source.get(), destination.get(), child)) return false;
+			if (created && fchmod(destination.get(), copiedMode(from.st_mode)) != 0)
+				return failed("set the permissions of", child);
+		} else if (!exists && S_ISREG(from.st_mode)) {
+			if (!copyFile(lower.fd(), upperFd, name, from, child)) return false;
+		}
+	}
+	return errno == 0;
+}
+
+}
+
+bool fillMissingTree(int lowerFd, int upperFd) {
+	bool previous = keepOwners;
+	keepOwners = false;
+	bool result = fillMissingBelow(lowerFd, upperFd, "");
+	keepOwners = previous;
+	return result;
 }
 
 bool isPlainOptionPath(std::string_view path) {
