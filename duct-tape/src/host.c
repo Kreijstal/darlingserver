@@ -25,9 +25,15 @@ int sysinfo(struct sysinfo *info);
 
 // Linux sysconf
 long sysconf(int name);
+#if defined(__ANDROID__)
+#define _SC_NPROCESSORS_CONF 0x0060
+#define _SC_NPROCESSORS_ONLN 0x0061
+#define _SC_PAGESIZE 0x0027
+#else
 #define _SC_NPROCESSORS_CONF 83
 #define _SC_NPROCESSORS_ONLN 84
 #define _SC_PAGESIZE 30
+#endif
 
 // Linux file access
 int open(const char* path, int flags, ...);
