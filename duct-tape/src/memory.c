@@ -648,15 +648,35 @@ kern_return_t mach_vm_msync(vm_map_t map, mach_vm_offset_t address, mach_vm_size
 };
 
 kern_return_t mach_vm_page_info(vm_map_t map, mach_vm_address_t address, vm_page_info_flavor_t flavor, vm_page_info_t info, mach_msg_type_number_t* count) {
-	dtape_stub_unsafe();
+	if (!count) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	// validate the request as XNU does, so unknown flavors keep their usual error
+	switch (flavor) {
+		case VM_PAGE_INFO_BASIC:
+			// XNU also accepts one int less (the structure was once unpadded)
+			if (*count != VM_PAGE_INFO_BASIC_COUNT && *count != VM_PAGE_INFO_BASIC_COUNT - 1) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			break;
+		default:
+			return KERN_INVALID_ARGUMENT;
+	}
+
+	// Page accounting is not implemented; let the caller handle unsupported queries.
+	*count = 0;
+	return KERN_NOT_SUPPORTED;
 };
 
 kern_return_t mach_vm_page_query(vm_map_t map, mach_vm_offset_t offset, int* disposition, int* ref_count) {
-	dtape_stub_unsafe();
+	return vm_map_page_query_internal(map, offset, disposition, ref_count);
 };
 
 kern_return_t mach_vm_page_range_query(vm_map_t map, mach_vm_offset_t address, mach_vm_size_t size, mach_vm_address_t dispositions_addr, mach_vm_size_t* dispositions_count) {
-	dtape_stub_unsafe();
+	// Page accounting is not implemented; let the caller handle unsupported queries.
+	if (dispositions_count) *dispositions_count = 0;
+	return KERN_NOT_SUPPORTED;
 };
 
 kern_return_t mach_vm_protect(vm_map_t map, mach_vm_offset_t start, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) {
@@ -1162,7 +1182,10 @@ kern_return_t mach_zone_info_for_zone(host_priv_t host, mach_zone_name_t name, m
 };
 
 kern_return_t vm_map_page_query_internal(vm_map_t target_map, vm_map_offset_t offset, int* disposition, int* ref_count) {
-	dtape_stub_unsafe();
+	// Page accounting is not implemented; let the caller handle unsupported queries.
+	if (disposition) *disposition = 0;
+	if (ref_count) *ref_count = 0;
+	return KERN_NOT_SUPPORTED;
 };
 
 kern_return_t vm_map_purgable_control(vm_map_t map, vm_map_offset_t address, vm_purgable_t control, int* state) {
