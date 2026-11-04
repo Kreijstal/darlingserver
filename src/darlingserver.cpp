@@ -846,6 +846,16 @@ static bool shouldUseOverlayFs() {
 	return shouldUse;
 }
 
+// overlayfs gives ',' ':' and backslash a meaning in its option string, so such paths cannot be passed unescaped.
+static bool isValidOverlayOptionPath(const char* path) {
+	for (const unsigned char* c = (const unsigned char*) path; *c; ++c) {
+		if (*c < 0x20 || *c == 0x7f || *c == ',' || *c == ':' || *c == '\\') {
+			return false;
+		}
+	}
+	return true;
+}
+
 static int compareTimespec(const timespec& a, const timespec& b) {
 	if (a.tv_sec != b.tv_sec) {
 		return (a.tv_sec > b.tv_sec) ? 1 : -1;
@@ -1222,6 +1232,11 @@ int main(int argc, char** argv) {
 		int workFD = openPrefixDir(parentFD, (upperName + ".workdir").c_str(), O_NOFOLLOW, true, originalUID, originalGID);
 		close(parentFD);
 		std::string libexec = DarlingServer::Config::getLibexecPath();
+		// lowerdir is the only path formatted into the option string; upperdir and workdir are /proc/self/fd paths.
+		if (!isValidOverlayOptionPath(libexec.c_str())) {
+			fprintf(stderr, "Cannot mount overlay: the libexec path (%s) must not contain ',', ':', '\\' or control characters\n", libexec.c_str());
+			exit(1);
+		}
 
 		// On prefix creation, give the user their own copies of the lower directories.
 		if (fix_permissions) {
