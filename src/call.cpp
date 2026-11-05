@@ -87,6 +87,11 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			return nullptr;
 		}
 
+		// checked before thread registration so a rejected message cannot change a thread's reply address
+		if (process->id() != requestMessage.pid()) {
+			throw std::runtime_error("System-reported message PID != darlingserver-recorded PID");
+		}
+
 		thread = threadRegistry().registerIfAbsent(header->tid, [&]() {
 			std::shared_ptr<Thread> tmp = nullptr;
 
@@ -117,10 +122,6 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		}
 
 		thread->setAddress(requestMessage.address());
-
-		if (process->id() != requestMessage.pid()) {
-			throw std::runtime_error("System-reported message PID != darlingserver-recorded PID");
-		}
 	}
 
 	auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");
