@@ -120,6 +120,10 @@ dtape_task_t* dtape_task_create(dtape_task_t* parent_task, uint32_t nsid, void* 
 	if (architecture == dserver_rpc_architecture_x86_64 || architecture == dserver_rpc_architecture_arm64) {
 		task_set_64Bit_addr(&task->xnu_task);
 		task_set_64Bit_data(&task->xnu_task);
+	} else {
+		// the IPC code tells a 32-bit task from a 64-bit one by the size of its map,
+		// and lays out out-of-line message descriptors (and their user-space size) to match
+		task->xnu_task.map->max_offset = VM_MAX_ADDRESS;
 	}
 
 	ipc_task_enable(&task->xnu_task);
@@ -174,10 +178,11 @@ void dtape_task_uidgid(dtape_task_t* task, int new_uid, int new_gid, int* old_ui
 	if (old_gid) {
 		*old_gid = task->xnu_task.audit_token.val[2];
 	}
-	if (new_uid >= 0) {
+	// -1 leaves an id unchanged. other negative values are real ids (e.g. -2 is `nobody`), since uid_t and gid_t are unsigned.
+	if (new_uid != -1) {
 		task->xnu_task.audit_token.val[1] = new_uid;
 	}
-	if (new_gid >= 0) {
+	if (new_gid != -1) {
 		task->xnu_task.audit_token.val[2] = new_gid;
 	}
 	task_unlock(&task->xnu_task);
@@ -321,7 +326,10 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 			uint64_t stimeus;
 			dtape_memory_info_t mem_info;
 
-			dtape_hooks->task_get_memory_info(task->context, &mem_info);
+			if (!dtape_hooks->task_get_memory_info(task->context, &mem_info)) {
+				// the process is gone; XNU rejects queries on inactive tasks the same way
+				return KERN_INVALID_ARGUMENT;
+			}
 
 			dtape_log_debug("%s: TODO: fetch utimeus and stimeus somehow", __FUNCTION__);
 			utimeus = 0;
@@ -495,20 +503,32 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 			memset(info, 0, orig_info_count * sizeof(natural_t));
 
 			dtape_memory_info_t meminfo;
-			dtape_hooks->task_get_memory_info(task->context, &meminfo);
+			if (!dtape_hooks->task_get_memory_info(task->context, &meminfo)) {
+				// the process is gone; XNU rejects queries on inactive tasks the same way
+				return KERN_INVALID_ARGUMENT;
+			}
 
 			info->page_size = meminfo.page_size;
 			info->resident_size = meminfo.resident_size;
-			info->resident_size_peak = meminfo.resident_size;
+			info->resident_size_peak = meminfo.resident_size_peak;
 			info->virtual_size = meminfo.virtual_size;
 
-			// TODO: fill in other stuff
+			// The breakdown follows Mach's meaning of the fields; the sources are the Rss*/VmSwap
+			// counters of /proc/<pid>/status (see Process::memoryInfo()). There is no compressor,
+			// so `compressed` stays 0 and swapped-out pages count towards the footprint instead.
+			// The other fields (device, reusable, purgeable_*, the per-tag ledgers) have no Linux
+			// counterpart and are 0.
+			info->internal = meminfo.internal_size;
+			info->external = meminfo.external_size;
 
 			*task_info_count = TASK_VM_INFO_REV0_COUNT;
 
 			if (orig_info_count >= TASK_VM_INFO_REV1_COUNT) {
 
 				*task_info_count = TASK_VM_INFO_REV1_COUNT;
+
+				// only revisions the caller's buffer has room for are filled
+				info->phys_footprint = meminfo.phys_footprint;
 
 				if (orig_info_count >= TASK_VM_INFO_REV2_COUNT) {
 
@@ -517,6 +537,7 @@ kern_return_t task_info(task_t xtask, task_flavor_t flavor, task_info_t task_inf
 					if (orig_info_count >= TASK_VM_INFO_REV3_COUNT) {
 
 						*task_info_count = TASK_VM_INFO_REV3_COUNT;
+						info->ledger_phys_footprint_peak = (int64_t)meminfo.phys_footprint_peak;
 
 						if (orig_info_count >= TASK_VM_INFO_REV4_COUNT) {
 
@@ -608,12 +629,17 @@ kern_return_t task_register_dyld_shared_cache_image_info(task_t task, dyld_kerne
 	dtape_stub_unsafe();
 };
 
+// Restartable ranges are accepted but not acted upon: darlingserver does not see a thread being
+// preempted or interrupted, so it never moves one back to a range's recovery address.
+// task_restartable_ranges_synchronize therefore has nothing to wait for.
 kern_return_t task_restartable_ranges_register(task_t task, task_restartable_range_t* ranges, mach_msg_type_number_t count) {
-	dtape_stub_safe(); return KERN_SUCCESS;
+	dtape_stub_safe();
+	return KERN_SUCCESS;
 };
 
 kern_return_t task_restartable_ranges_synchronize(task_t task) {
-	dtape_stub_safe(); return KERN_SUCCESS;
+	dtape_stub_safe();
+	return KERN_SUCCESS;
 };
 
 kern_return_t task_set_exc_guard_behavior(task_t task, task_exc_guard_behavior_t behavior) {
@@ -652,12 +678,13 @@ kern_return_t task_unregister_dyld_image_infos(task_t task, dyld_kernel_image_in
 	dtape_stub_unsafe();
 };
 
-static kern_return_t task_for_pid_internal(mach_port_name_t target_tport, int pid, uintptr_t t, bool task_name) {
+static kern_return_t task_for_pid_internal(mach_port_name_t target_tport, int pid, uintptr_t t, mach_task_flavor_t flavor) {
 	kern_return_t kr = KERN_FAILURE;
 	task_t receiving_task = TASK_NULL;
 	dtape_task_t* looked_up_task = NULL;
 	ipc_port_t right = IPC_PORT_NULL;
 	mach_port_name_t out_name = MACH_PORT_NULL;
+	dtape_task_port_flavor_t hook_flavor;
 
 	receiving_task = port_name_to_task(target_tport);
 	if (receiving_task == TASK_NULL) {
@@ -669,17 +696,46 @@ static kern_return_t task_for_pid_internal(mach_port_name_t target_tport, int pi
 		goto out;
 	}
 
-	if (task_name) {
+	switch (flavor) {
+	case TASK_FLAVOR_NAME:
+		hook_flavor = dtape_task_port_flavor_name;
+		break;
+	case TASK_FLAVOR_READ:
+		hook_flavor = dtape_task_port_flavor_read;
+		break;
+	case TASK_FLAVOR_INSPECT:
+		hook_flavor = dtape_task_port_flavor_inspect;
+		break;
+	default:
+		hook_flavor = dtape_task_port_flavor_control;
+		break;
+	}
+
+	// the server decides, according to the code signing policy of the target
+	if (!dtape_hooks->task_port_allowed(dtape_task_for_xnu_task(current_task())->context, looked_up_task->context, hook_flavor)) {
+		goto out;
+	}
+
+	switch (flavor) {
+	case TASK_FLAVOR_NAME:
 		right = convert_task_name_to_port(&looked_up_task->xnu_task);
-	} else {
+		break;
+	case TASK_FLAVOR_READ:
+		right = convert_task_read_to_port(&looked_up_task->xnu_task);
+		break;
+	case TASK_FLAVOR_INSPECT:
+		right = convert_task_inspect_to_port(&looked_up_task->xnu_task);
+		break;
+	default:
 		if (&looked_up_task->xnu_task == current_task()) {
 			right = convert_task_to_port_pinned(&looked_up_task->xnu_task);
 		} else {
 			right = convert_task_to_port(&looked_up_task->xnu_task);
 		}
+		break;
 	}
 
-	// consumed by convert_task{,_name}_to_port{,_pinned}
+	// consumed by convert_task{,_name,_read,_inspect}_to_port{,_pinned}
 	looked_up_task = NULL;
 
 	if (right == IPC_PORT_NULL) {
@@ -721,11 +777,19 @@ out:
 };
 
 kern_return_t task_for_pid(struct task_for_pid_args* args) {
-	return task_for_pid_internal(args->target_tport, args->pid, args->t, false);
+	return task_for_pid_internal(args->target_tport, args->pid, args->t, TASK_FLAVOR_CONTROL);
 };
 
 kern_return_t task_name_for_pid(struct task_name_for_pid_args* args) {
-	return task_for_pid_internal(args->target_tport, args->pid, args->t, true);
+	return task_for_pid_internal(args->target_tport, args->pid, args->t, TASK_FLAVOR_NAME);
+};
+
+int dtape_task_read_for_pid(uint32_t target_tport, int32_t pid, uint64_t t) {
+	return task_for_pid_internal(target_tport, pid, t, TASK_FLAVOR_READ);
+};
+
+int dtape_task_inspect_for_pid(uint32_t target_tport, int32_t pid, uint64_t t) {
+	return task_for_pid_internal(target_tport, pid, t, TASK_FLAVOR_INSPECT);
 };
 
 kern_return_t pid_for_task(struct pid_for_task_args* args) {

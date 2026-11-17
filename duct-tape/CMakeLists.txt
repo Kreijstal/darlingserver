@@ -129,7 +129,7 @@ add_compile_definitions(
 
 # On Android (Bionic libc) and platforms lacking bcmp(), map it to memcmp
 # which has identical equality semantics (returns zero iff memory regions match).
-if (ANDROID)
+if (ANDROID OR DSERVER_BIONIC)
 	add_compile_definitions(bcmp=memcmp)
 else()
 	include(CheckSymbolExists)
@@ -286,6 +286,8 @@ add_library(darlingserver_duct_tape STATIC
 	src/psynch.c
 	src/condvar.c
 	src/debug.c
+	src/fileport.c
+	src/csr.c
 
 	xnu/libkern/os/refcnt.c
 	xnu/libkern/gen/OSAtomicOperations.c

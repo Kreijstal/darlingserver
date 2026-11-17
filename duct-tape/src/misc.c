@@ -87,6 +87,11 @@ ssize_t getrandom(void* buf, size_t buflen, unsigned int flags);
 
 
 void dtape_logv(dtape_log_level_t level, const char* format, va_list args) {
+	// don't format messages that would be dropped anyway
+	if (dtape_hooks->log_enabled && !dtape_hooks->log_enabled(level)) {
+		return;
+	}
+
 	char message[4096];
 	vsnprintf(message, sizeof(message), format, args);
 	dtape_hooks->log(level, message);
@@ -172,9 +177,15 @@ fls(unsigned int mask)
 #include <kern/simple_lock.h>
 
 // PAGE_SHIFT_CONST is extern on ARM64 (variable page size support in XNU).
-// dtape_memory_init() replaces this with the host page shift before anything
-// reads PAGE_SIZE; 12 is only the value it holds until then.
-int PAGE_SHIFT_CONST = 12;
+// It is duct-tape's own allocation granularity, not the page size guests see: that comes
+// from the commpage, which mldr fills in from the host and which is 16K on some of them.
+// The VMAPPLE board configuration (__ARM_16K_PG__) gives every other translation unit a
+// compile-time PAGE_SHIFT of ARM_PGSHIFT; the few that read this variable must agree with
+// them, whatever the host's page size.
+#if !__ARM_16K_PG__
+#error "duct-tape expects the 16K page configuration of the VMAPPLE board"
+#endif
+int PAGE_SHIFT_CONST = ARM_PGSHIFT;
 
 // ARM simple lock init (normally in arm/locks_arm.c).
 // The arm/simple_lock.h macro `simple_lock_init(l, t)` maps to this;

@@ -68,11 +68,13 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->processing_signal = false;
 	thread->name = NULL;
 	thread->waiting_suspended = false;
+	libsimple_lock_init(&thread->block_suspend_gate);
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
 	dtape_condvar_init(&thread->suspension_condvar);
 	memset(&thread->xnu_thread, 0, sizeof(thread->xnu_thread));
 	memset(&thread->kwe, 0, sizeof(thread->kwe));
+	thread->uu_flag = 0;
 
 	memset(&thread->default_state, 0, sizeof(thread->default_state));
 	LIST_INSERT_HEAD(&thread->user_states, &thread->default_state, link);
@@ -237,7 +239,7 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 		thread_set_state(current_thread(), x86_FLOAT_STATE32, (thread_state_t) &fstate, x86_FLOAT_STATE32_COUNT);
 	} else
 #endif
-#if defined(__aarch64__) || defined(__arm64__)
+#if __aarch64__
 	if (task->architecture == dserver_rpc_architecture_arm64) {
 		arm_thread_state64_t tstate;
 		arm_neon_state64_t fstate;
@@ -292,7 +294,7 @@ int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_sta
 		}
 	} else
 #endif
-#if defined(__aarch64__) || defined(__arm64__)
+#if __aarch64__
 	if (task->architecture == dserver_rpc_architecture_arm64) {
 		arm_thread_state64_t tstate;
 		arm_neon_state64_t fstate;
@@ -592,10 +594,18 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 
 	bool waiting = thread->xnu_thread.state & TH_WAIT;
 
+	// a wakeup that arrives after we drop the thread lock but before the
+	// microthread is actually suspended would find nothing to resume and be lost.
+	// hold the gate until the server has suspended us (it unlocks it for us then);
+	// thread_unblock() takes it before resuming us.
+	if (waiting) {
+		libsimple_lock_lock(&thread->block_suspend_gate);
+	}
+
 	thread_unlock(&thread->xnu_thread);
 
 	if (waiting) {
-		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, &thread->block_suspend_gate);
 	}
 
 	thread_lock(&thread->xnu_thread);
@@ -618,16 +628,33 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+
+	// wait until a thread that is about to suspend itself has finished doing so
+	libsimple_lock_lock(&thread->block_suspend_gate);
+
 	thread->xnu_thread.wait_result = wresult;
-	// Match XNU's wait-timer cancellation. A callback already dequeued still
-	// owns its active count, but must not time out a subsequent unrelated wait.
+
+	// Cancel any pending wait timer, like XNU's thread_unblock() does.
+	//
+	// Without this, a timed wait that completes normally leaves the wait timer
+	// armed; it fires later, during an unrelated untimed wait, and delivers a
+	// spurious THREAD_TIMED_OUT (which surfaces as MACH_RCV_TIMED_OUT from a
+	// receive issued with MACH_MSG_TIMEOUT_NONE).
 	if (thread->xnu_thread.wait_timer_is_set) {
 		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
 			thread->xnu_thread.wait_timer_active--;
 		}
 		thread->xnu_thread.wait_timer_is_set = FALSE;
 	}
+
+	// like XNU, the thread is no longer waiting. this matters when the wakeup
+	// comes before the thread reaches thread_block(): it must not suspend then.
+	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	thread->xnu_thread.state |= TH_RUN;
+
 	dtape_hooks->thread_resume(thread->context);
+
+	libsimple_lock_unlock(&thread->block_suspend_gate);
 	return TRUE;
 };
 
@@ -637,12 +664,26 @@ kern_return_t thread_go(thread_t thread, wait_result_t wresult, waitq_options_t 
 };
 
 wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interruptible_orig) {
-	dtape_stub_safe();
-	thread->state = TH_WAIT;
-	thread->wait_result = THREAD_WAITING;
-	thread->block_hint = thread->pending_block_hint;
+	// the abort handling is adapted from XNU's thread_mark_wait_locked() in osfmk/kern/sched_prim.c
+	wait_interrupt_t interruptible = interruptible_orig & TH_OPT_INTMASK;
+	boolean_t at_safe_point = (interruptible == THREAD_ABORTSAFE);
+
+	if (interruptible == THREAD_UNINT ||
+	    !(thread->sched_flags & TH_SFLAG_ABORT) ||
+	    (!at_safe_point && (thread->sched_flags & TH_SFLAG_ABORTSAFELY))) {
+		thread->state = TH_WAIT;
+		thread->at_safe_point = at_safe_point;
+		thread->wait_result = THREAD_WAITING;
+		thread->block_hint = thread->pending_block_hint;
+		thread->pending_block_hint = kThreadWaitNone;
+		return THREAD_WAITING;
+	}
+
+	if (thread->sched_flags & TH_SFLAG_ABORTSAFELY) {
+		thread->sched_flags &= ~TH_SFLAG_ABORTED_MASK;
+	}
 	thread->pending_block_hint = kThreadWaitNone;
-	return THREAD_WAITING;
+	return thread->wait_result = THREAD_INTERRUPTED;
 };
 
 kern_return_t thread_terminate(thread_t xthread) {
@@ -928,9 +969,9 @@ thread_set_state(
 			default:
 				return KERN_INVALID_ARGUMENT;
 		}
-	} else
+	}
 #endif
-#if defined(__aarch64__) || defined(__arm64__)
+#if __aarch64__
 	if (dtask->architecture == dserver_rpc_architecture_arm64) {
 		switch (flavor)
 		{
@@ -979,11 +1020,9 @@ thread_set_state(
 			default:
 				return KERN_INVALID_ARGUMENT;
 		}
-	} else
-#endif
-	{
-		return KERN_FAILURE;
 	}
+#endif
+	return KERN_FAILURE;
 }
 
 kern_return_t
@@ -1235,9 +1274,9 @@ thread_get_state_internal(
 			default:
 				return KERN_INVALID_ARGUMENT;
 		}
-	} else
+	}
 #endif
-#if defined(__aarch64__) || defined(__arm64__)
+#if __aarch64__
 	if (dtask->architecture == dserver_rpc_architecture_arm64) {
 		switch (flavor)
 		{
@@ -1290,11 +1329,9 @@ thread_get_state_internal(
 			default:
 				return KERN_INVALID_ARGUMENT;
 		}
-	} else
-#endif
-	{
-		return KERN_FAILURE;
 	}
+#endif
+	return KERN_FAILURE;
 }
 
 kern_return_t
@@ -1373,13 +1410,37 @@ kern_return_t thread_abort(thread_t thread) {
 };
 
 kern_return_t thread_abort_safely(thread_t thread) {
-	// TODO: actually do something?
-	//       in the LKM, we used to call `kick_process` here
-	//       (which would presumably interrupt any syscalls).
-	//       to replicate that, we'd probably have to use another
-	//       real-time signal with SA_RESTART off.
-	dtape_stub();
+	// this only interrupts waits inside darlingserver;
+	// in the LKM, we used to call `kick_process` here
+	// (which would presumably interrupt any syscalls).
+	// to replicate that, we'd probably have to use another
+	// real-time signal with SA_RESTART off.
+	//
+	// the rest is adapted from XNU's thread_abort_safely() in osfmk/kern/thread_act.c
+	thread_lock(thread);
+	if (!thread->at_safe_point || clear_wait_internal(thread, THREAD_INTERRUPTED) != KERN_SUCCESS) {
+		if (!(thread->sched_flags & TH_SFLAG_ABORT)) {
+			thread->sched_flags |= TH_SFLAG_ABORTED_MASK;
+		}
+	}
+	thread_unlock(thread);
 	return KERN_SUCCESS;
+};
+
+void dtape_thread_returning_to_user(dtape_thread_t* thread) {
+	thread_t xthread = &thread->xnu_thread;
+
+	// in XNU, an abort that did not interrupt a wait only lasts until the thread returns to user space,
+	// where thread_apc_ast() clears it. our threads "return to user space" when a call replies.
+	// (an abort set while the thread was already in user space instead lasts until its next call replies;
+	// that covers the window between libsystem_kernel's TSD check and the call that starts the wait.)
+	if (!(xthread->sched_flags & TH_SFLAG_ABORTED_MASK)) {
+		return;
+	}
+
+	thread_lock(xthread);
+	xthread->sched_flags &= ~TH_SFLAG_ABORTED_MASK;
+	thread_unlock(xthread);
 };
 
 kern_return_t thread_convert_thread_state(thread_t thread, int direction, thread_state_flavor_t flavor, thread_state_t in_state, mach_msg_type_number_t in_state_count, thread_state_t out_state, mach_msg_type_number_t* out_state_count) {
@@ -1495,63 +1556,105 @@ kern_return_t thread_policy(thread_t thread, policy_t policy, policy_base_t base
 	return KERN_SUCCESS;
 };
 
+// Darling keeps no per-thread scheduling policy (thread_policy_set accepts and ignores it), so every
+// thread reports what a thread with nothing set reports on macOS. Each flavor fills in only its own
+// count of integers; `get_default` is left as the caller passed it unless noted.
 kern_return_t thread_policy_get(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t policy_info, mach_msg_type_number_t* count, boolean_t* get_default) {
 	if (!thread || !policy_info || !count || !get_default) {
 		return KERN_INVALID_ARGUMENT;
 	}
 
-	mach_msg_type_number_t required;
 	switch (flavor) {
-		case THREAD_EXTENDED_POLICY:
-			required = THREAD_EXTENDED_POLICY_COUNT;
-			break;
-		case THREAD_TIME_CONSTRAINT_POLICY:
-			required = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
-			break;
+		case THREAD_EXTENDED_POLICY: {
+			// QUIRK: a count smaller than THREAD_EXTENDED_POLICY_COUNT is not an error for this flavor:
+			// the call succeeds and returns nothing, with the count unchanged (0 stays 0).
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "EXTENDED with count 0".
+			if (*count < THREAD_EXTENDED_POLICY_COUNT) {
+				return KERN_SUCCESS;
+			}
+			((thread_extended_policy_t)policy_info)->timeshare = TRUE;
+			*count = THREAD_EXTENDED_POLICY_COUNT;
+			return KERN_SUCCESS;
+		}
+
+		case THREAD_TIME_CONSTRAINT_POLICY: {
+			if (*count < THREAD_TIME_CONSTRAINT_POLICY_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			// QUIRK: a thread that is not real-time reports period 0, computation 5 ms, constraint
+			// 10 ms (both in absolute time units) and preemptible TRUE, and get_default is set to TRUE.
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "TIME_CONSTRAINT".
+			thread_time_constraint_policy_t info = (thread_time_constraint_policy_t)policy_info;
+			uint64_t computation, constraint;
+			nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &computation);
+			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &constraint);
+			info->period = 0;
+			info->computation = (uint32_t)computation;
+			info->constraint = (uint32_t)constraint;
+			info->preemptible = TRUE;
+			*count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+			*get_default = TRUE;
+			return KERN_SUCCESS;
+		}
+
 		case THREAD_PRECEDENCE_POLICY:
-			required = THREAD_PRECEDENCE_POLICY_COUNT;
-			break;
-		case THREAD_AFFINITY_POLICY:
-			required = THREAD_AFFINITY_POLICY_COUNT;
-			break;
-		case THREAD_BACKGROUND_POLICY:
-			required = THREAD_BACKGROUND_POLICY_COUNT;
-			break;
-		case THREAD_POLICY_STATE:
-			required = THREAD_POLICY_STATE_COUNT;
-			break;
+			if (*count < THREAD_PRECEDENCE_POLICY_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			((thread_precedence_policy_t)policy_info)->importance = 0;
+			*count = THREAD_PRECEDENCE_POLICY_COUNT;
+			return KERN_SUCCESS;
+
 		case THREAD_LATENCY_QOS_POLICY:
-			required = THREAD_LATENCY_QOS_POLICY_COUNT;
-			break;
+			if (*count < THREAD_LATENCY_QOS_POLICY_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			((thread_latency_qos_policy_t)policy_info)->thread_latency_qos_tier = LATENCY_QOS_TIER_UNSPECIFIED;
+			*count = THREAD_LATENCY_QOS_POLICY_COUNT;
+			return KERN_SUCCESS;
+
 		case THREAD_THROUGHPUT_QOS_POLICY:
-			required = THREAD_THROUGHPUT_QOS_POLICY_COUNT;
-			break;
-		case THREAD_QOS_POLICY:
-		case THREAD_QOS_POLICY_OVERRIDE:
-			required = THREAD_QOS_POLICY_COUNT;
-			break;
+			if (*count < THREAD_THROUGHPUT_QOS_POLICY_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			((thread_throughput_qos_policy_t)policy_info)->thread_throughput_qos_tier = THROUGHPUT_QOS_TIER_UNSPECIFIED;
+			*count = THREAD_THROUGHPUT_QOS_POLICY_COUNT;
+			return KERN_SUCCESS;
+
+		case THREAD_QOS_POLICY: {
+			if (*count < THREAD_QOS_POLICY_COUNT) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			// QUIRK: a thread with no QoS set reports THREAD_QOS_LEGACY with relative priority 0, but
+			// the default asked for with get_default TRUE is THREAD_QOS_UNSPECIFIED.
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "QOS".
+			thread_qos_policy_t info = (thread_qos_policy_t)policy_info;
+			info->qos_tier = *get_default ? THREAD_QOS_UNSPECIFIED : THREAD_QOS_LEGACY;
+			info->tier_importance = 0;
+			*count = THREAD_QOS_POLICY_COUNT;
+			return KERN_SUCCESS;
+		}
+
+		// QUIRK: affinity sets are not supported (KERN_NOT_SUPPORTED), and the private
+		// THREAD_POLICY_STATE flavor is refused with KERN_PROTECTION_FAILURE for an ordinary caller.
+		// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+		// Rosetta (tier 2).
+		// Test: tests/src/thread_policy_get.c (main tree), "AFFINITY" and "POLICY_STATE".
+		case THREAD_AFFINITY_POLICY:
+			return KERN_NOT_SUPPORTED;
+		case THREAD_POLICY_STATE:
+			return KERN_PROTECTION_FAILURE;
+
+		// THREAD_BACKGROUND_POLICY and THREAD_QOS_POLICY_OVERRIDE can be set but not read
 		default:
 			return KERN_INVALID_ARGUMENT;
 	}
-
-	if (*count < required) {
-		return KERN_INVALID_ARGUMENT;
-	}
-	memset(policy_info, 0, required * sizeof(integer_t));
-	*count = required;
-	*get_default = TRUE;
-
-	if (flavor == THREAD_EXTENDED_POLICY) {
-		((thread_extended_policy_t)policy_info)->timeshare = TRUE;
-	} else if (flavor == THREAD_QOS_POLICY || flavor == THREAD_QOS_POLICY_OVERRIDE) {
-		((thread_qos_policy_t)policy_info)->qos_tier = THREAD_QOS_LEGACY;
-	} else if (flavor == THREAD_POLICY_STATE) {
-		thread_policy_state_t state = (thread_policy_state_t)policy_info;
-		state->requested = THREAD_QOS_LEGACY;
-		state->effective = THREAD_QOS_LEGACY;
-	}
-
-	return KERN_SUCCESS;
 };
 
 kern_return_t thread_policy_set(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t policy_info, mach_msg_type_number_t count) {
@@ -1572,11 +1675,11 @@ kern_return_t thread_wire(host_priv_t host_priv, thread_t thread, boolean_t wire
 };
 
 kern_return_t thread_getstatus_to_user(thread_t thread, int flavor, thread_state_t tstate, mach_msg_type_number_t* count) {
-	dtape_stub_unsafe();
+	return thread_get_state_to_user(thread, flavor, tstate, count);
 };
 
 kern_return_t thread_setstatus_from_user(thread_t thread, int flavor, thread_state_t tstate, mach_msg_type_number_t count) {
-	dtape_stub_unsafe();
+	return thread_set_state_from_user(thread, flavor, tstate, count);
 };
 
 boolean_t thread_should_abort(thread_t thread) {

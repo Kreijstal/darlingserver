@@ -39,9 +39,12 @@
 #include <sys/wait.h>
 
 #include <darlingserver/logging.hpp>
+#include <darlingserver/code-signing.hpp>
+#include <darlingserver/system-config.hpp>
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
 static DarlingServer::Log serverLog("server");
+static DarlingServer::Log codeSigningLog("codesign");
 
 struct DTapeHooks {
 	static void dtape_hook_thread_suspend(void* thread_context, dtape_thread_continuation_callback_f continuationCallback, void* continuationContext, libsimple_lock_t* unlockMe) {
@@ -116,8 +119,27 @@ struct DTapeHooks {
 		}
 	};
 
+	static DarlingServer::Log& dtapeLog() {
+		static DarlingServer::Log log("dtape");
+		return log;
+	};
+
+	static bool dtape_hook_log_enabled(dtape_log_level_t level) {
+		switch (level) {
+			case dtape_log_level_debug:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Debug);
+			case dtape_log_level_info:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Info);
+			case dtape_log_level_warning:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Warning);
+			case dtape_log_level_error:
+			default:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Error);
+		}
+	};
+
 	static void dtape_hook_log(dtape_log_level_t level, const char* message) {
-		static const auto log = DarlingServer::Log("dtape");
+		const auto& log = dtapeLog();
 		auto process = DarlingServer::Process::currentProcess();
 		auto thread = DarlingServer::Thread::currentThread();
 		pid_t pid = process ? process->id() : -1;
@@ -271,12 +293,25 @@ struct DTapeHooks {
 		return process->_dtapeTask;
 	};
 
-	static void dtape_hook_task_get_memory_info(void* task_context, dtape_memory_info_t* memory_info) {
-		auto info = static_cast<DarlingServer::Process*>(task_context)->memoryInfo();
+	static bool dtape_hook_task_get_memory_info(void* task_context, dtape_memory_info_t* memory_info) {
+		DarlingServer::Process::MemoryInfo info;
+		try {
+			info = static_cast<DarlingServer::Process*>(task_context)->memoryInfo();
+		} catch (const std::system_error&) {
+			// the process has died (or is dying)
+			return false;
+		}
 		memory_info->virtual_size = info.virtualSize;
 		memory_info->resident_size = info.residentSize;
 		memory_info->page_size = info.pageSize;
 		memory_info->region_count = info.regionCount;
+		memory_info->resident_size_peak = info.residentSizePeak;
+		memory_info->internal_size = info.internalSize;
+		memory_info->external_size = info.externalSize;
+		memory_info->swapped_size = info.swappedSize;
+		memory_info->phys_footprint = info.physFootprint;
+		memory_info->phys_footprint_peak = info.physFootprintPeak;
+		return true;
 	};
 
 	static bool dtape_hook_task_get_memory_region_info(void* task_context, uintptr_t address, dtape_memory_region_info_t* memory_region_info) {
@@ -364,6 +399,42 @@ struct DTapeHooks {
 		return static_cast<DarlingServer::Process*>(task_context)->eternalID();
 	};
 
+	static bool dtape_hook_task_port_allowed(void* caller_task_context, void* target_task_context, dtape_task_port_flavor_t flavor) {
+		using namespace DarlingServer::CodeSigning;
+
+		auto caller = static_cast<DarlingServer::Process*>(caller_task_context);
+		auto target = static_cast<DarlingServer::Process*>(target_task_context);
+
+		if (!caller || !target) {
+			return true;
+		}
+
+		PortFlavor portFlavor = PortFlavor::Control;
+		switch (flavor) {
+			case dtape_task_port_flavor_name:    portFlavor = PortFlavor::Name; break;
+			case dtape_task_port_flavor_inspect: portFlavor = PortFlavor::Inspect; break;
+			case dtape_task_port_flavor_read:    portFlavor = PortFlavor::Read; break;
+			case dtape_task_port_flavor_control: portFlavor = PortFlavor::Control; break;
+		}
+
+		auto state = target->codeSigningState();
+		if (state.code_signing_policy == dserver_code_signing_policy_off) {
+			return true;
+		}
+
+		bool isSelf = (caller == target);
+		auto csr = DarlingServer::SystemConfig::sharedInstance().current().csr_active_config;
+		auto verdict = applyPolicy(state.code_signing_policy, taskPortRule(isSelf, isSelf ? 0 : caller->guestUID(), isSelf ? 0 : target->guestUID(), state, portFlavor, csr));
+
+		if (verdict == Verdict::Denied) {
+			codeSigningLog.warning() << "task_for_pid (flavor " << static_cast<int>(flavor) << ") by " << *caller << " for " << *target << " denied" << codeSigningLog.endLog;
+		} else if (verdict == Verdict::WouldDeny) {
+			codeSigningLog.info() << "task_for_pid (flavor " << static_cast<int>(flavor) << ") by " << *caller << " for " << *target << " would be denied under enforcement" << codeSigningLog.endLog;
+		}
+
+		return verdict != Verdict::Denied;
+	};
+
 #if DSERVER_EXTENDED_DEBUG
 	static void dtape_hook_task_register_name(void* task_context, uint32_t name, uintptr_t pointer) {
 		static_cast<DarlingServer::Process*>(task_context)->_registerName(name, pointer);
@@ -393,6 +464,7 @@ struct DTapeHooks {
 		.timer_arm = dtape_hook_timer_arm,
 
 		.log = dtape_hook_log,
+		.log_enabled = dtape_hook_log_enabled,
 		.get_load_info = dtape_hook_get_load_info,
 
 		.thread_suspend = dtape_hook_thread_suspend,
@@ -428,6 +500,7 @@ struct DTapeHooks {
 		.task_sync_memory = dtape_hook_task_sync_memory,
 		.task_context_dispose = dtape_hook_task_context_dispose,
 		.task_eternal_id = dtape_hook_task_eternal_id,
+		.task_port_allowed = dtape_hook_task_port_allowed,
 
 #if DSERVER_EXTENDED_DEBUG
 		.task_register_name = dtape_hook_task_register_name,
@@ -438,6 +511,9 @@ struct DTapeHooks {
 #endif
 	};
 };
+
+// set while the main loop runs a call inline; the loop flushes the outbox itself right afterwards, so no eventfd wakeup is needed
+static thread_local bool runningInline = false;
 
 DarlingServer::Server::Server(std::string prefix):
 	_prefix(prefix),
@@ -504,6 +580,9 @@ DarlingServer::Server::Server(std::string prefix):
 		// if it does, that means the main loop has been waiting a LONG time for the listener socket to become writable again.
 		// in that case, we don't really care if the eventfd is being incremented; we can't send anything anyways.
 		// once the socket becomes writable again, the eventfd will be monitored again.
+		if (runningInline) {
+			return;
+		}
 		eventfd_write(_wakeupFD, 1);
 	});
 
@@ -553,28 +632,42 @@ void DarlingServer::Server::start() {
 					continue;
 				}
 				if (call) {
-					_workQueue.push(call->thread());
+					auto thread = call->thread();
+					runningInline = true;
+					bool ranInline = _workQueue.tryRunInline(thread);
+					runningInline = false;
+					if (!ranInline) {
+						_workQueue.push(std::move(thread));
+					}
 				}
 			}
 		}
 
-		// reset the eventfd by reading from it
-		eventfd_t value;
-		eventfd_read(_wakeupFD, &value);
+		// reset the eventfd by reading from it (only needed once it has fired; it is one-shot, so a fired eventfd is no longer armed)
+		if (!_wakeupArmed) {
+			eventfd_t value;
+			eventfd_read(_wakeupFD, &value);
+		}
 
 		if (_canWrite) {
 			_canWrite = _outbox.sendMany(_listenerSocket);
 		}
 
-		struct epoll_event settings;
-		settings.data.ptr = &_wakeupFD;
-		settings.events = (_canWrite) ? (EPOLLIN | EPOLLONESHOT) : 0;
+		// the eventfd is only watched while we can write; avoid the syscall when that hasn't changed
+		if (_wakeupArmed != _canWrite) {
+			struct epoll_event settings;
+			settings.data.ptr = &_wakeupFD;
+			settings.events = (_canWrite) ? (EPOLLIN | EPOLLONESHOT) : 0;
 
-		if (epoll_ctl(_epollFD, EPOLL_CTL_MOD, _wakeupFD, &settings) < 0) {
-			throw std::system_error(errno, std::generic_category(), "Failed to modify eventfd in epoll context");
+			if (epoll_ctl(_epollFD, EPOLL_CTL_MOD, _wakeupFD, &settings) < 0) {
+				throw std::system_error(errno, std::generic_category(), "Failed to modify eventfd in epoll context");
+			}
+
+			_wakeupArmed = _canWrite;
 		}
 
 		struct epoll_event events[16];
+
 		int ret = epoll_wait(_epollFD, events, 16, -1);
 
 		if (ret < 0) {
@@ -597,6 +690,8 @@ void DarlingServer::Server::start() {
 					_canWrite = true;
 				}
 			} else if (event->data.ptr == &_wakeupFD) {
+				// one-shot: the kernel disarmed it when it reported the event
+				_wakeupArmed = false;
 				// we allow the loop to go back to the top and try to send some messages
 				// (if _canWrite is true, the eventfd will be reset; otherwise, there's no point in resetting it)
 			} else if (event->data.ptr == &_timerFD) {
@@ -828,5 +923,12 @@ std::shared_ptr<DarlingServer::FD> DarlingServer::Monitor::fd() const {
 };
 
 void DarlingServer::Server::sendMessage(Message&& message) {
-	_outbox.push(std::move(message));
+	// send it from this thread instead of waking the main loop for it; the main loop is only woken (through the
+	// outbox's notification callback) when the socket is full, and then sends the rest once it is writable again
+	try {
+		_outbox.pushAndSend(std::move(message), _listenerSocket);
+	} catch (const std::system_error&) {
+		// the messages stay in the outbox and the main loop has been notified: its sendMany() reports the error,
+		// as it did before replies were sent from here
+	}
 };

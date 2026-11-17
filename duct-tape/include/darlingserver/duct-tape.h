@@ -12,6 +12,7 @@
 
 #include <darlingserver/duct-tape/types.h>
 #include <darlingserver/duct-tape/hooks.h>
+#include <darlingserver/duct-tape/csr.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,24 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 dtape_kqchan_mach_port_t* dtape_kqchan_mach_port_create(dtape_task_t* owning_task, uint32_t port, uint64_t receive_buffer, uint64_t receive_buffer_size, uint64_t saved_filter_flags, dtape_kqchan_mach_port_notification_callback_f notification_callback, void* context);
 dtape_semaphore_t* dtape_semaphore_create(dtape_task_t* owning_task, int initial_value);
 
+/**
+ * Creates a fileport for @p fd in @p task and stores the name of the task's new send right to it in @p out_port_name.
+ * The fileport takes ownership of @p fd, even on failure. The descriptor is closed when the last send right is gone.
+ *
+ * Returns `dtape_fileport_result_no_resources` if the port could not be allocated
+ * and `dtape_fileport_result_invalid_port` if the right could not be added to the task.
+ */
+dtape_fileport_result_t dtape_fileport_makeport(dtape_task_t* task, int fd, uint32_t* out_port_name);
+
+/**
+ * Stores a new descriptor (a `dup()` of the one held by the fileport named @p port_name in @p task) in @p out_fd.
+ * The caller owns the new descriptor. The task's send right is not consumed.
+ *
+ * Returns `dtape_fileport_result_invalid_port` if @p port_name does not name a send right to a fileport
+ * and `dtape_fileport_result_no_resources` if the descriptor could not be duplicated.
+ */
+dtape_fileport_result_t dtape_fileport_makefd(dtape_task_t* task, uint32_t port_name, int* out_fd);
+
 void dtape_kqchan_mach_port_destroy(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_destroy(dtape_semaphore_t* semaphore);
 
@@ -80,7 +99,15 @@ void dtape_thread_sigexc_enter(dtape_thread_t* thread);
 void dtape_thread_sigexc_exit(dtape_thread_t* thread);
 void dtape_thread_sigexc_enter2(dtape_thread_t* thread);
 void dtape_thread_dying(dtape_thread_t* thread);
+int dtape_thread_pthread_canceled(dtape_thread_t* thread, int action);
+bool dtape_thread_pthread_testcancel(dtape_thread_t* thread);
+bool dtape_thread_pthread_markcancel(dtape_thread_t* thread, bool* interrupt);
+void dtape_thread_returning_to_user(dtape_thread_t* thread);
 
+/**
+ * Reads and optionally changes the task's uid and gid. Passing -1 as `new_uid` or `new_gid` leaves that id unchanged;
+ * any other value, including other negative ones such as -2 (`nobody`), is stored as the new id.
+ */
 void dtape_task_uidgid(dtape_task_t* task, int new_uid, int new_gid, int* old_uid, int* old_gid);
 void dtape_task_retain(dtape_task_t* task);
 void dtape_task_release(dtape_task_t* task);
@@ -104,6 +131,11 @@ bool dtape_kqchan_mach_port_has_events(dtape_kqchan_mach_port_t* kqchan);
 void dtape_semaphore_up(dtape_semaphore_t* semaphore);
 dtape_semaphore_wait_result_t dtape_semaphore_down(dtape_semaphore_t* semaphore);
 bool dtape_semaphore_down_simple(dtape_semaphore_t* semaphore);
+
+/**
+ * Makes `host_info()` report @p memory_size bytes of memory; 0 reports the host's memory again.
+ */
+void dtape_host_set_memory_size(uint64_t memory_size);
 
 uint64_t dtape_debug_task_port_count(dtape_task_t* task);
 uint64_t dtape_debug_task_list_ports(dtape_task_t* task, dtape_debug_task_list_ports_iterator_f iterator, void* context);

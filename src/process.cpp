@@ -23,11 +23,23 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <darlingserver/logging.hpp>
+#include <darlingserver/code-signing.hpp>
+#include <darlingserver/system-config.hpp>
+#include <kern/cs_blobs.h>
 
 #include <fstream>
-#include <regex>
+#include <cstdio>
+#include <cstring>
 
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <atomic>
+#include <algorithm>
+#include <string>
+
+#include "procmap-query.h"
 
 static DarlingServer::Log processLog("process");
 
@@ -80,6 +92,17 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 
 		// inherit groups from parent process
 		_groups = parentProcess->_groups;
+
+		// a forked process runs the same code as its parent, in the same sandbox,
+		// but has not denied attachment itself
+		_csState = parentProcess->_csState;
+		_csState.darling_flags = CodeSigning::darlingFlagsInheritedByFork(_csState.darling_flags);
+		_csImage = parentProcess->_csImage;
+	} else {
+		_resetCodeSigningState();
+
+		// the first process has no parent to inherit from, so it may register once
+		_csMayRegister = (_nspid == 1);
 	}
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
@@ -104,11 +127,13 @@ DarlingServer::Process::Process(KernelProcessConstructorTag tag):
 #else
 	#error Unknown architecture
 #endif
+	_resetCodeSigningState();
 	_dtapeTask = dtape_task_create(nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
 };
 
 DarlingServer::Process::~Process() {
 	processLog.info() << *this << ": process being destroyed" << processLog.endLog;
+	_closeMapsDescriptor();
 };
 
 DarlingServer::Process::ID DarlingServer::Process::id() const {
@@ -278,7 +303,7 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFork) {
 	std::unique_lock lock(_rwlock);
 
 	bool didExec = _pendingReplacement;
@@ -313,6 +338,9 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// update the process architecture
 		_architecture = architecture;
 
+		// the old `/proc/<pid>/maps` descriptor refers to the address space that the exec replaced
+		_closeMapsDescriptor();
+
 		// replace the old task with a new task that inherits from it
 		auto oldTask = _dtapeTask;
 		auto newTask = dtape_task_create(oldTask, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
@@ -322,6 +350,13 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		auto oldThread = mainThread->_dtapeThread;
 		auto newThread = dtape_thread_create(_dtapeTask, mainThread->_nstid, mainThread.get());
 		mainThread->_dtapeThread = newThread;
+
+		// the cancel flag's TSD slot belonged to the old image;
+		// the new image registers its own when its libpthread initializes
+		mainThread->_cancelMarkedAddress = 0;
+
+		// the loader reports the new image's UUID once it has parsed the image
+		_executableUuid = {};
 
 		// destroy the main thread's old S2C semaphores
 		dtape_semaphore_destroy(mainThread->_s2cPerformSempahore);
@@ -351,7 +386,16 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		mainThread->_s2cReplySempahore = dtape_semaphore_create(_dtapeTask, 0);
 		mainThread->_s2cInterruptEnterSemaphore = dtape_semaphore_create(_dtapeTask, 0);
 		mainThread->_s2cInterruptExitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
-	} else {
+
+		// the new image has not been verified yet, and it starts under the policy in effect now;
+		// a denial of attachment and a sandbox survive the exec
+		{
+			auto kept = CodeSigning::darlingFlagsKeptAcrossExec(_csState.darling_flags);
+			_resetCodeSigningState();
+			_csState.darling_flags |= kept;
+			_csMayRegister = true;
+		}
+	} else if (isFork) {
 		// fork case
 
 		if (architecture != _architecture) {
@@ -366,10 +410,24 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 	if (didExec) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
-	} else {
+	} else if (isFork) {
+		// only a fork child's check-in: its parent waits in fork() for exactly this one. a check-in
+		// from an exec'd image whose exec has not been reported yet must not wake the parent, or the
+		// parent's next fork() returns before that child has checked in and inherited its ports.
 		// notify the parent process (if we have one) that we've arrived
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+			// a forked child runs the parent's image
+			setExecutablePath(parent->executablePath());
+			setExecutableUuid(parent->executableUuid());
+
+			{
+				// the parent may have died (or be dying) before we checked in;
+				// its fork-wait semaphore is gone then and there's no one left to wake up
+				std::shared_lock parentLock(parent->_rwlock);
+				if (parent->_dtapeForkWaitSemaphore) {
+					dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+				}
+			}
 			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
 		}
 	}
@@ -395,9 +453,9 @@ void DarlingServer::Process::unregisterKqchan(std::shared_ptr<Kqchan> kqchan) {
 	_kqchannels.erase(kqchan->_idForProcess());
 };
 
-void DarlingServer::Process::waitForChildAfterFork() {
+bool DarlingServer::Process::waitForChildAfterFork() {
 	// this function is always called within a microthread
-	dtape_semaphore_down_simple(_dtapeForkWaitSemaphore);
+	return dtape_semaphore_down_simple(_dtapeForkWaitSemaphore);
 };
 
 void DarlingServer::Process::registerListeningKqchan(std::shared_ptr<Kqchan::Process> kqchan) {
@@ -448,10 +506,13 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call memoryInfo");
 	}
 
-	MemoryInfo info;
+	MemoryInfo info {};
 	std::ifstream file("/proc/" + std::to_string(_pid) + "/statm");
 
-	file >> info.virtualSize >> info.residentSize;
+	if (!(file >> info.virtualSize >> info.residentSize)) {
+		// the process died after the check above
+		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call memoryInfo");
+	}
 
 	info.virtualSize *= sysconf(_SC_PAGESIZE);
 	info.residentSize *= sysconf(_SC_PAGESIZE);
@@ -462,10 +523,169 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
 	// TODO
 	info.regionCount = 0;
 
+	// the breakdown: Linux has no counterpart of the compressor, so swap is the stand-in
+	// for compressed memory in the footprint, and the rest follows Mach's definitions of
+	// "internal" (anonymous) and "external" (file-backed) pages
+	uint64_t rssAnon = 0, rssFile = 0, rssShmem = 0, vmSwap = 0, vmHwm = 0;
+	bool haveBreakdown = false;
+	{
+		std::ifstream status("/proc/" + std::to_string(_pid) + "/status");
+		std::string line;
+		while (std::getline(status, line)) {
+			unsigned long long kb = 0;
+			char name[16] = {0};
+			if (sscanf(line.c_str(), "%15[A-Za-z]: %llu kB", name, &kb) != 2) {
+				continue;
+			}
+			if (strcmp(name, "RssAnon") == 0) {
+				rssAnon = kb * 1024;
+				haveBreakdown = true;
+			} else if (strcmp(name, "RssFile") == 0) {
+				rssFile = kb * 1024;
+			} else if (strcmp(name, "RssShmem") == 0) {
+				rssShmem = kb * 1024;
+			} else if (strcmp(name, "VmSwap") == 0) {
+				vmSwap = kb * 1024;
+			} else if (strcmp(name, "VmHWM") == 0) {
+				vmHwm = kb * 1024;
+			}
+		}
+	}
+
+	if (haveBreakdown) {
+		info.internalSize = rssAnon + rssShmem;
+		info.externalSize = rssFile;
+		info.swappedSize = vmSwap;
+	} else {
+		// no per-type counters (kernels before 4.5): count everything resident as anonymous
+		info.internalSize = info.residentSize;
+	}
+	info.physFootprint = info.internalSize + info.swappedSize;
+
+	// The kernel's high-water mark can lag the resident size it has just reported by a
+	// few pages (per-thread counter batching), so both peaks are also kept monotonic
+	// here: a peak never goes down between queries.
+	auto raisePeak = [](std::atomic<uint64_t>& peak, uint64_t value) {
+		uint64_t current = peak.load(std::memory_order_relaxed);
+		while (current < value && !peak.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+		}
+		return std::max(current, value);
+	};
+	info.residentSizePeak = raisePeak(_residentSizePeak, std::max(vmHwm, info.residentSize));
+	info.physFootprintPeak = raisePeak(_physFootprintPeak, info.physFootprint);
+
 	return info;
 };
 
-static const std::regex memoryRegionEntryRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)\\s+((?:r|w|x|p|s|\\-)+)\\s+([0-9a-fA-F]+)");
+// parses the "start-end perms offset" prefix of a `/proc/<pid>/maps` line
+static bool parseMapsLine(const std::string& line, uintptr_t& start, uintptr_t& end, char (&perms)[8], uintptr_t& offset) {
+	unsigned long long startValue = 0;
+	unsigned long long endValue = 0;
+	unsigned long long offsetValue = 0;
+	char permsValue[8] = {0};
+
+	if (sscanf(line.c_str(), "%llx-%llx %7s %llx", &startValue, &endValue, permsValue, &offsetValue) != 4) {
+		return false;
+	}
+
+	start = startValue;
+	end = endValue;
+	offset = offsetValue;
+	memcpy(perms, permsValue, sizeof(perms));
+	return true;
+};
+
+// runs PROCMAP_QUERY on a `/proc/<pid>/maps` descriptor; returns 0 or an errno value
+static int procmapQuery(int mapsFd, uint64_t address, uint64_t flags, struct procmap_query& query) {
+	memset(&query, 0, sizeof(query));
+	query.size = sizeof(query);
+	query.query_flags = flags;
+	query.query_addr = address;
+	return (ioctl(mapsFd, PROCMAP_QUERY, &query) == 0) ? 0 : errno;
+};
+
+static int procmapProtection(uint64_t vmaFlags) {
+	int protection = 0;
+	if (vmaFlags & PROCMAP_QUERY_VMA_READABLE) {
+		protection |= PROT_READ;
+	}
+	if (vmaFlags & PROCMAP_QUERY_VMA_WRITABLE) {
+		protection |= PROT_WRITE;
+	}
+	if (vmaFlags & PROCMAP_QUERY_VMA_EXECUTABLE) {
+		protection |= PROT_EXEC;
+	}
+	return protection;
+};
+
+// set once the running kernel turns out not to support PROCMAP_QUERY
+static std::atomic<bool> procmapQueryUnsupported(false);
+
+void DarlingServer::Process::_closeMapsDescriptor() {
+	std::unique_lock lock(_mapsMutex);
+	if (_mapsFd >= 0) {
+		close(_mapsFd);
+		_mapsFd = -1;
+	}
+};
+
+//
+// Looks up the VMA that covers `address` (or, with `coveringOrNext`, the first one above it) with PROCMAP_QUERY.
+//
+// Returns false if the lookup found nothing or could not be done at all; the caller then parses the text of
+// `/proc/<pid>/maps`, which also lists the gate area ("[vsyscall]") that PROCMAP_QUERY does not report.
+//
+bool DarlingServer::Process::_queryRegion(uintptr_t address, bool coveringOrNext, uintptr_t& start, uintptr_t& end, int& protection, bool& shared, uint64_t& offset) const {
+	if (procmapQueryUnsupported.load(std::memory_order_relaxed)) {
+		return false;
+	}
+
+	std::unique_lock lock(_mapsMutex);
+
+	// a cached descriptor can go stale (e.g. its address space is gone after an exec); retry once with a fresh one
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		bool fresh = false;
+
+		if (_mapsFd < 0) {
+			_mapsFd = open(("/proc/" + std::to_string(_pid) + "/maps").c_str(), O_RDONLY | O_CLOEXEC);
+			if (_mapsFd < 0) {
+				return false;
+			}
+			fresh = true;
+		}
+
+		struct procmap_query query;
+		int error = procmapQuery(_mapsFd, address, coveringOrNext ? PROCMAP_QUERY_COVERING_OR_NEXT_VMA : 0, query);
+
+		if (error == 0) {
+			start = query.vma_start;
+			end = query.vma_end;
+			protection = procmapProtection(query.vma_flags);
+			shared = (query.vma_flags & PROCMAP_QUERY_VMA_SHARED) != 0;
+			offset = query.vma_offset;
+			return true;
+		}
+
+		if (error == ENOENT) {
+			return false;
+		}
+
+		close(_mapsFd);
+		_mapsFd = -1;
+
+		// ENOTTY: the kernel predates PROCMAP_QUERY; EINVAL on a fresh descriptor: it rejects this layout of the query
+		if (error == ENOTTY || (fresh && error == EINVAL)) {
+			procmapQueryUnsupported.store(true, std::memory_order_relaxed);
+			return false;
+		}
+
+		if (fresh) {
+			return false;
+		}
+	}
+
+	return false;
+};
 
 DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInfo(uintptr_t address) const {
 	if (isDead()) {
@@ -473,21 +693,24 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 	}
 
 	MemoryRegionInfo info;
+	uintptr_t endAddress;
+
+	if (_queryRegion(address, false, info.startAddress, endAddress, info.protection, info.shared, info.mapOffset)) {
+		info.pageCount = (endAddress - info.startAddress) / sysconf(_SC_PAGESIZE);
+		return info;
+	}
+
 	std::ifstream file("/proc/" + std::to_string(_pid) + "/maps");
 	std::string line;
 
-	uintptr_t endAddress;
-
 	while (std::getline(file, line)) {
-		std::smatch match;
+		char perms[8];
+		uintptr_t mapOffset;
 
-		if (!std::regex_search(line, match, memoryRegionEntryRegex)) {
+		if (!parseMapsLine(line, info.startAddress, endAddress, perms, mapOffset)) {
 			processLog.warning() << "Encountered malformed `/proc/<pid>/maps` entry? Definitely a bug (on our part)." << processLog.endLog;
 			continue;
 		}
-
-		info.startAddress = std::stoul(match[1].str(), nullptr, 16);
-		endAddress = std::stoul(match[2].str(), nullptr, 16);
 
 		if (endAddress <= address || info.startAddress > address) {
 			continue;
@@ -495,23 +718,21 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 
 		info.pageCount = (endAddress - info.startAddress) / sysconf(_SC_PAGESIZE);
 
-		info.mapOffset = std::stoul(match[4].str(), nullptr, 16);
-
-		auto perms = match[3].str();
+		info.mapOffset = mapOffset;
 
 		info.protection = 0;
 
-		if (perms.find('r') != std::string::npos) {
+		if (strchr(perms, 'r')) {
 			info.protection |= PROT_READ;
 		}
-		if (perms.find('w') != std::string::npos) {
+		if (strchr(perms, 'w')) {
 			info.protection |= PROT_WRITE;
 		}
-		if (perms.find('x') != std::string::npos) {
+		if (strchr(perms, 'x')) {
 			info.protection |= PROT_EXEC;
 		}
 
-		info.shared = perms.find('s') != std::string::npos;
+		info.shared = strchr(perms, 's') != nullptr;
 
 		return info;
 	}
@@ -570,6 +791,93 @@ bool DarlingServer::Process::setTracerProcess(std::shared_ptr<Process> tracerPro
 	return true;
 };
 
+bool DarlingServer::Process::clearTracerProcess(std::shared_ptr<Process> tracerProcess) {
+	std::unique_lock lock(_rwlock);
+	auto current = _tracerProcess.lock();
+	if (current && current != tracerProcess) {
+		return false;
+	}
+	_tracerProcess.reset();
+	return true;
+};
+
+void DarlingServer::Process::_resetCodeSigningState() {
+	static std::atomic<uint64_t> nextGeneration{1};
+	auto config = SystemConfig::sharedInstance().current();
+
+	memset(&_csState, 0, sizeof(_csState));
+	_csState.version = DSERVER_CS_STATE_VERSION;
+	_csState.size = sizeof(_csState);
+	_csState.status = dserver_cs_status_unregistered;
+	_csState.code_signing_policy = config.code_signing_policy;
+	_csState.csr_active_config = config.csr_active_config;
+	_csState.generation = nextGeneration++;
+	_csImage = nullptr;
+	_csMayRegister = false;
+};
+
+uint32_t DarlingServer::Process::guestUID() const {
+	int uid = -1;
+	std::shared_lock lock(_rwlock);
+	dtape_task_uidgid(_dtapeTask, -1, -1, &uid, nullptr);
+	return static_cast<uint32_t>(uid);
+};
+
+dserver_cs_state_t DarlingServer::Process::codeSigningState() const {
+	std::shared_lock lock(_rwlock);
+	return _csState;
+};
+
+std::shared_ptr<const DarlingServer::CodeSigning::Image> DarlingServer::Process::codeSigningImage() const {
+	std::shared_lock lock(_rwlock);
+	return _csImage;
+};
+
+bool DarlingServer::Process::registerCodeSigningImage(std::shared_ptr<const CodeSigning::Image> image) {
+	std::unique_lock lock(_rwlock);
+
+	// registering once per exec only matters when a code signing policy is in effect
+	if (!image || (!_csMayRegister && _csState.code_signing_policy == dserver_code_signing_policy_enforce)) {
+		return false;
+	}
+	_csMayRegister = false;
+
+	auto policy = _csState.code_signing_policy;
+	auto csr = _csState.csr_active_config;
+	auto generation = _csState.generation;
+	auto kept = CodeSigning::darlingFlagsKeptAcrossExec(_csState.darling_flags);
+
+	_csState = image->state;
+	_csState.code_signing_policy = policy;
+	_csState.csr_active_config = csr;
+	_csState.generation = generation;
+	_csState.darling_flags = (image->state.darling_flags & DSERVER_CS_TRUST_STORE) | kept;
+	_csImage = (image->state.status == dserver_cs_status_valid) ? image : nullptr;
+
+	return true;
+};
+
+uint32_t DarlingServer::Process::updateCodeSigningFlags(uint32_t set, uint32_t clear) {
+	std::unique_lock lock(_rwlock);
+
+	// only a validly signed process has flags to change; clearing CS_VALID is permanent
+	if (_csState.status == dserver_cs_status_valid) {
+		_csState.flags = (_csState.flags | set) & ~clear;
+	}
+
+	return _csState.flags;
+};
+
+void DarlingServer::Process::denyAttach() {
+	std::unique_lock lock(_rwlock);
+	_csState.darling_flags |= DSERVER_CS_DENY_ATTACH;
+};
+
+void DarlingServer::Process::markSandboxed() {
+	std::unique_lock lock(_rwlock);
+	_csState.darling_flags |= DSERVER_CS_SANDBOXED;
+};
+
 std::shared_ptr<DarlingServer::Thread> DarlingServer::Process::_pickS2CThread(void) const {
 	if (isDead()) {
 		return nullptr;
@@ -605,6 +913,16 @@ std::string DarlingServer::Process::executablePath() const {
 void DarlingServer::Process::setExecutablePath(std::string path) {
 	std::unique_lock lock(_rwlock);
 	_executablePath = std::move(path);
+};
+
+std::array<uint8_t, 16> DarlingServer::Process::executableUuid() const {
+	std::shared_lock lock(_rwlock);
+	return _executableUuid;
+};
+
+void DarlingServer::Process::setExecutableUuid(const std::array<uint8_t, 16>& uuid) {
+	std::unique_lock lock(_rwlock);
+	_executableUuid = uuid;
 };
 
 uintptr_t DarlingServer::Process::allocatePages(size_t pageCount, int protection, uintptr_t addressHint, bool fixed, bool overwrite) {
@@ -657,26 +975,41 @@ void DarlingServer::Process::syncMemory(uintptr_t address, size_t size, int sync
 	return thread->syncMemory(address, size, sync_flags);
 };
 
-static const std::regex memoryRegionEntryAddressRegex("([0-9a-fA-F]+)\\-([0-9a-fA-F]+)");
-
 uintptr_t DarlingServer::Process::getNextRegion(uintptr_t address) const {
 	if (isDead()) {
 		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call getNextRegion");
+	}
+
+	if (address != UINTPTR_MAX) {
+		uintptr_t start;
+		uintptr_t end;
+		int protection;
+		bool shared;
+		uint64_t offset;
+
+		// the VMA covering or following `address + 1`; if that one starts at or below `address`, the next region follows it
+		bool found = _queryRegion(address + 1, true, start, end, protection, shared, offset);
+		if (found && start <= address) {
+			found = _queryRegion(end, true, start, end, protection, shared, offset);
+		}
+		if (found) {
+			return start;
+		}
 	}
 
 	std::ifstream file("/proc/" + std::to_string(_pid) + "/maps");
 	std::string line;
 
 	while (std::getline(file, line)) {
-		std::smatch match;
+		uintptr_t startAddress;
+		uintptr_t endAddress;
+		uintptr_t mapOffset;
+		char perms[8];
 
-		if (!std::regex_search(line, match, memoryRegionEntryAddressRegex)) {
+		if (!parseMapsLine(line, startAddress, endAddress, perms, mapOffset)) {
 			processLog.warning() << "Encountered malformed `/proc/<pid>/maps` entry? Definitely a bug (on our part)." << processLog.endLog;
 			continue;
 		}
-
-		auto startAddress = std::stoul(match[1].str(), nullptr, 16);
-		auto endAddress = std::stoul(match[2].str(), nullptr, 16);
 
 		if (startAddress <= address) {
 			continue;
@@ -727,9 +1060,14 @@ void DarlingServer::Process::notifyDead() {
 	// dtape_thread_release needs a microthread context, so we call it within a kernel microthread
 	// also destroy the fork-wait semaphore here
 	Thread::kernelAsync([self = shared_from_this()]() {
-		if (self->_dtapeForkWaitSemaphore) {
-			dtape_semaphore_destroy(self->_dtapeForkWaitSemaphore);
+		dtape_semaphore_t* forkWaitSemaphore = nullptr;
+		{
+			std::unique_lock lock(self->_rwlock);
+			forkWaitSemaphore = self->_dtapeForkWaitSemaphore;
 			self->_dtapeForkWaitSemaphore = nullptr;
+		}
+		if (forkWaitSemaphore) {
+			dtape_semaphore_destroy(forkWaitSemaphore);
 		}
 		dtape_task_release(self->_dtapeTask);
 		self->_dtapeTask = nullptr;

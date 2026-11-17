@@ -36,23 +36,26 @@
 #include <sys/resource.h>
 #include <iostream>
 #include <linux/sched.h>
-#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/signal.h>
+#include <sys/socket.h>
 #include <filesystem>
 #include <climits>
+#include <string>
+#include <sys/wait.h>
+#include <sysexits.h>
+#include <grp.h>
+#include <vector>
 
 #include <darling-config.h>
 
 #include <darlingserver/server.hpp>
 #include <darlingserver/config.hpp>
+#include <darlingserver/prefix-setup.hpp>
+#include <darlingserver/run-mode.hpp>
 
 #ifndef DARLINGSERVER_INIT_PROCESS
 	#define DARLINGSERVER_INIT_PROCESS "/sbin/launchd"
-#endif
-
-#ifndef DARLINGSERVER_XDG_USER_DIR_CMD
-	#define DARLINGSERVER_XDG_USER_DIR_CMD "xdg-user-dir"
 #endif
 
 #if DSERVER_ASAN
@@ -61,97 +64,50 @@
 
 // TODO: most of the code here was ported over from startup/darling.c; we should C++-ify it.
 
-static void temp_drop_privileges(uid_t uid, gid_t gid);
-static void regain_privileges();
+// How this process was started. Root until main() has looked at the kernel's facts about the process;
+// only Root has privileges to take care with.
+static DarlingServer::RunMode::Mode runMode = DarlingServer::RunMode::Mode::Root;
 
-// Opens a directory of the user's prefix for root-mode setup. The path is resolved with the user's
-// privileges; the directory must be owned by the user, or by root when rootOwnedOK.
-static int openPrefixDir(int dirFD, const char* path, int flags, bool rootOwnedOK, uid_t originalUID, gid_t originalGID)
+static bool runningAsRoot() {
+	return runMode == DarlingServer::RunMode::Mode::Root;
+}
+
+// The user's directory of this kind (an xdg-user-dirs name such as "DOWNLOAD"), exactly as
+// xdg-user-dir prints it, including its fallback to $HOME (or $HOME/Desktop) when the file or the
+// entry is missing. The configuration file is read and parsed here rather than by running
+// xdg-user-dir, a shell script that sources it: this runs with the user's ids only, and nothing the
+// user configures gets to run. An empty result (xdg-user-dir printing an empty line) means no link.
+static bool xdgDirectory(const std::string& config, const char* name, const char* home, std::string& dir)
 {
-	temp_drop_privileges(originalUID, originalGID);
-	int fd = openat(dirFD, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | flags);
-	if (fd < 0) {
-		fprintf(stderr, "Cannot open directory %s: %s\n", path, strerror(errno));
-		exit(1);
-	}
-	regain_privileges();
+	dir = DarlingServer::PrefixSetup::userDirOrDefault(config, name, home);
+	return !dir.empty();
+}
+
+// Reads the user's user-dirs.dirs, from $XDG_CONFIG_HOME or else ~/.config. Without one, contents
+// stays empty and every directory gets xdg-user-dir's fallback.
+static bool readUserDirsConfig(const char* home, std::string& contents)
+{
+	const char* configHome = getenv("XDG_CONFIG_HOME");
+	std::string path = (configHome && configHome[0] == '/') ? std::string(configHome) : std::string(home) + "/.config";
+	path += "/user-dirs.dirs";
+
+	int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return false;
 
 	struct stat st;
-	if (fstat(fd, &st) != 0 || (st.st_uid != originalUID && !(rootOwnedOK && st.st_uid == 0))) {
-		fprintf(stderr, "%s is not owned by the invoking user\n", path);
-		exit(1);
-	}
-	return fd;
-}
-
-// Run as the user before the overlay is mounted: creates each directory of the lower tree in the upper one,
-// so the merged prefix directories belong to the user without root changing any owner. Takes ownership of lowerFD.
-static void mirrorDirectoryTree(int lowerFD, int upperFD)
-{
-	DIR* dir = fdopendir(lowerFD);
-	if (!dir) {
-		close(lowerFD);
-		return;
-	}
-
-	struct dirent* ent;
-	while ((ent = readdir(dir)) != NULL)
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
 	{
-		struct stat st;
-		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0
-			|| fstatat(dirfd(dir), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode))
-			continue;
-
-		// Undo the umask through the opened directory, never by resolving the name again.
-		bool created = mkdirat(upperFD, ent->d_name, 0700) == 0;
-		if (!created && errno != EEXIST)
-			fprintf(stderr, "Cannot create prefix directory %s: %s\n", ent->d_name, strerror(errno));
-
-		int lowerChild = openat(dirfd(dir), ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-		int upperChild = openat(upperFD, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-		if (lowerChild >= 0 && upperChild >= 0)
-			mirrorDirectoryTree(lowerChild, upperChild);
-		else if (lowerChild >= 0)
-			close(lowerChild);
-		if (upperChild >= 0) {
-			if (created && fchmod(upperChild, st.st_mode & ALLPERMS) != 0) {
-				fprintf(stderr, "Cannot set prefix directory permissions: %s\n", strerror(errno));
-				exit(1);
-			}
-			close(upperChild);
-		}
+		close(fd);
+		return false;
 	}
 
-	closedir(dir);
-}
-
-const char* xdgDirectory(const char* name)
-{
-	static char dir[4096];
-#define DARLING_XDG_REDIRECT " 2>/dev/null"
-	size_t cmd_len = sizeof(DARLINGSERVER_XDG_USER_DIR_CMD " " DARLING_XDG_REDIRECT) + strlen(name);
-	char* cmd = (char*) malloc(cmd_len);
-	if (!cmd) return "";
-	snprintf(cmd, cmd_len, DARLINGSERVER_XDG_USER_DIR_CMD " %s" DARLING_XDG_REDIRECT, name);
-
-	FILE* proc = popen(cmd, "r");
-
-	free(cmd);
-
-	if (!proc)
-		return NULL;
-
-	fgets(dir, sizeof(dir)-1, proc);
-
-	pclose(proc);
-
-	size_t len = strlen(dir);
-	if (len <= 1)
-		return NULL;
-
-	if (dir[len-1] == '\n')
-		dir[len-1] = '\0';
-	return dir;
+	char buffer[4096];
+	ssize_t got;
+	while (contents.size() < 65536 && (got = read(fd, buffer, sizeof(buffer))) > 0)
+		contents.append(buffer, got);
+	close(fd);
+	return true;
 }
 
 // Gives a home what a new macOS account gets: what it lacks of
@@ -225,6 +181,9 @@ void setupUserHome(const char* prefix, uid_t originalUID)
 	// symlink /Users/$LOGIN/LinuxHome -> $HOME
 	symlink(buf2, buf);
 
+	std::string userDirsConfig;
+	readUserDirsConfig(home, userDirsConfig);
+
 	static const char* xdgmap[][2] = {
 		{ "DESKTOP", "Desktop" },
 		{ "DOWNLOAD", "Downloads" },
@@ -237,11 +196,11 @@ void setupUserHome(const char* prefix, uid_t originalUID)
 
 	for (int i = 0; i < sizeof(xdgmap) / sizeof(xdgmap[0]); i++)
 	{
-		const char* dir = xdgDirectory(xdgmap[i][0]);
-		if (!dir)
+		std::string dir;
+		if (!xdgDirectory(userDirsConfig, xdgmap[i][0], home, dir))
 			continue;
 
-		snprintf(buf2, sizeof(buf2), "/Volumes/SystemRoot%s", dir);
+		snprintf(buf2, sizeof(buf2), "/Volumes/SystemRoot%s", dir.c_str());
 		snprintf(buf, sizeof(buf), "%s/Users/%s/%s", prefix, login, xdgmap[i][1]);
 
 		unlink(buf);
@@ -249,7 +208,7 @@ void setupUserHome(const char* prefix, uid_t originalUID)
 	}
 
 	snprintf(buf, sizeof(buf), "%s/Users/%s", prefix, login);
-	fillFromUserTemplate(DarlingServer::Config::getLibexecPath() + "/System/Library/User Template", buf);
+	fillFromUserTemplate(DarlingServer::Config::libexecPath() + "/System/Library/User Template", buf);
 }
 
 void setupCoredumpPattern(void)
@@ -287,48 +246,19 @@ static void wipeDir(const char* dirpath)
 		else if (ent->d_type == DT_SOCK)
 		{
 			/* Leave sockets alone. wipeDir runs on every container start, and
-			 * /var/run and /var/tmp are where out-of-container services put
-			 * their listeners - a host service binding a socket under the
-			 * prefix has it deleted out from under it at every boot, so a guest
-			 * can never connect to it. Nothing here owns a socket: the
-			 * container's own state in these directories is files and
-			 * directories, and the one socket the container itself needs
-			 * (shellspawn.sock) is created after this runs. */
+			 * /var/run is where out-of-container services put their
+			 * listeners - a host service binding a socket under the prefix has
+			 * it deleted out from under it at every boot, so a guest can never
+			 * connect to it. Nothing here owns a socket: the container's own
+			 * state in this directory is files and directories, and the one
+			 * socket the container itself needs (shellspawn.sock) is created
+			 * after this runs. */
 		}
 		else
 			unlink(path);
 	}
 
 	closedir(dir);
-}
-
-static void ensureProcSymlink(const char* prefixPath)
-{
-	char procPath[4096];
-	struct stat st;
-	snprintf(procPath, sizeof(procPath), "%s/proc", prefixPath);
-	if (lstat(procPath, &st) == 0)
-	{
-		if (S_ISDIR(st.st_mode))
-		{
-			rmdir(procPath);
-		}
-		else if (S_ISLNK(st.st_mode))
-		{
-			char target[256];
-			ssize_t len = readlink(procPath, target, sizeof(target) - 1);
-			if (len > 0)
-			{
-				target[len] = '\0';
-				if (strcmp(target, "/Volumes/SystemRoot/proc") != 0)
-					unlink(procPath);
-			}
-		}
-	}
-	if (lstat(procPath, &st) != 0)
-	{
-		symlink("/Volumes/SystemRoot/proc", procPath);
-	}
 }
 
 static void ensureShSymlink(const char* prefixPath)
@@ -761,16 +691,9 @@ static void ensureHomebrewSymlinks(const char* prefixPath)
 	}
 }
 
-void darlingPreInit(const char* prefix)
+static void darlingPreInit(const char* prefix)
 {
-	// This runs between temp_drop_privileges() and regain_privileges(), so geteuid() is
-	// never 0 here; check the saved set-user-ID to tell a temporary drop from non-root mode.
-	uid_t ruid, euid, suid;
-	bool hasRoot = getresuid(&ruid, &euid, &suid) == 0 && (ruid == 0 || euid == 0 || suid == 0);
-	if (getenv("DARLING_NONROOT") != NULL || !hasRoot)
-	{
-		ensureProcSymlink(prefix);
-	}
+	// The shell and the Homebrew-compatible layout, for a prefix that was set up without them.
 	ensureShSymlink(prefix);
 	ensureHomebrewSymlinks(prefix);
 
@@ -793,6 +716,21 @@ void darlingPreInit(const char* prefix)
 	}
 }
 
+static void detachStdio(void)
+{
+	int fd = open("/dev/null", O_RDWR);
+
+	if (fd < 0)
+		return;
+
+	dup2(fd, STDIN_FILENO);
+	dup2(fd, STDOUT_FILENO);
+	dup2(fd, STDERR_FILENO);
+
+	if (fd > STDERR_FILENO)
+		close(fd);
+}
+
 void spawnLaunchd(const char* prefix)
 {
 	puts("Bootstrapping the container with launchd...");
@@ -807,13 +745,29 @@ void spawnLaunchd(const char* prefix)
 		initPath = DARLINGSERVER_INIT_PROCESS;
 	}
 
-	std::string libexec = DarlingServer::Config::getLibexecPath();
+	const std::string& libexec = DarlingServer::Config::libexecPath();
 	setenv("__mldr_DYLD_ROOT_PATH", libexec.c_str(), 1);
 	setenv("__mldr_sockpath", tmp.c_str(), 1);
+
+	// Without a PID namespace launchd is not process 1 and has no procfs of its own; it is told so.
+	// This is the server's own finding about itself, not a setting taken from anyone's environment.
+	if (runMode == DarlingServer::RunMode::Mode::NonRoot) {
+		setenv("DARLING_NONROOT", "1", 1);
+	} else {
+		unsetenv("DARLING_NONROOT");
+	}
+
+	// These describe the host user and its host paths. launchd sets them for
+	// each job from the job's own account, but never replaces inherited ones.
+	static const char* const hostIdentityVars[] = { "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR" };
+	for (const char* var: hostIdentityVars) {
+		unsetenv(var);
+	}
+
+	detachStdio();
 	std::string mldrPath = DarlingServer::Config::defaultMldrPath();
-	char vchrootArg0[4096];
-	snprintf(vchrootArg0, sizeof(vchrootArg0), "mldr!%s/usr/libexec/darling/vchroot", libexec.c_str());
-	execl(mldrPath.c_str(), vchrootArg0, "vchroot", prefix, initPath, NULL);
+	std::string vchrootArg0 = "mldr!" + libexec + "/usr/libexec/darling/vchroot";
+	execl(mldrPath.c_str(), vchrootArg0.c_str(), "vchroot", prefix, initPath, NULL);
 
 	fprintf(stderr, "Failed to exec launchd: %s\n", strerror(errno));
 	abort();
@@ -841,6 +795,8 @@ static bool isOnWsl1() {
 	if (!initialized) {
 		initialized = true;
 		// WSL1 kernels report a release such as "4.4.0-19041-Microsoft"; WSL2 uses "-microsoft-standard".
+		// The match is case-sensitive on purpose: a case-insensitive one would also match WSL2,
+		// which does not need the WSL1 workarounds.
 		struct utsname name;
 		result = uname(&name) == 0 && strstr(name.release, "Microsoft") != NULL;
 	}
@@ -848,203 +804,9 @@ static bool isOnWsl1() {
 	return result;
 }
 
-static bool shouldUseOverlayFs() {
-	bool shouldUse = true;
-	bool explicitlySet = false;
-
-	if (testEnvVar("DARLING_NOOVERLAYFS")) {
-		shouldUse = false;
-		explicitlySet = true;
-	} else if (getenv("DARLING_NOOVERLAYFS")) {
-		shouldUse = true;
-		explicitlySet = true;
-	}
-
-	// https://github.com/microsoft/WSL/issues/8748
-	// Microsoft is being dumb with its overlayfs implementation and they don't seem to be willing to be fix WSL1-related bugs.
-	// We therefore have to enable this hack on WSL1.
-	if (!explicitlySet && isOnWsl1()) {
-		shouldUse = false;
-	}
-
-	return shouldUse;
-}
-
-// overlayfs gives ',' ':' and backslash a meaning in its option string, so such paths cannot be passed unescaped.
-static bool isValidOverlayOptionPath(const char* path) {
-	for (const unsigned char* c = (const unsigned char*) path; *c; ++c) {
-		if (*c < 0x20 || *c == 0x7f || *c == ',' || *c == ':' || *c == '\\') {
-			return false;
-		}
-	}
-	return true;
-}
-
-static int compareTimespec(const timespec& a, const timespec& b) {
-	if (a.tv_sec != b.tv_sec) {
-		return (a.tv_sec > b.tv_sec) ? 1 : -1;
-	} else if (a.tv_nsec != b.tv_nsec) {
-		return (a.tv_nsec > b.tv_nsec) ? 1 : -1;
-	} else {
-		return 0;
-	}
-}
-
-// The copy runs with the user's privileges, and entries an earlier root-mode copy left
-// root-owned can't be updated; skip them instead of aborting the whole copy.
-static bool skipUnwritableEntry(const char* what, const std::string& path) {
-	if (errno != EPERM && errno != EACCES) {
-		return false;
-	}
-	fprintf(stderr, "Skipping %s: cannot %s: %s\n", path.c_str(), what, strerror(errno));
-	return true;
-}
-
-static void copyAndSetAttributes(std::string& fromPath, std::string& toPath) {
-	struct stat fromStat, toStat;
-	if (lstat(fromPath.c_str(), &fromStat) == -1) {
-		fprintf(stderr, "Failed to stat file %s: %s\n", fromPath.c_str(), strerror(errno));
-		abort();
-	}
-	bool destinationExists = true;
-	bool updateAttributes = false;
-	if (lstat(toPath.c_str(), &toStat) == -1) {
-		if (errno != ENOENT) {
-			fprintf(stderr, "Failed to stat file %s: %s\n", toPath.c_str(), strerror(errno));
-			abort();
-		}
-		destinationExists = false;
-	}
-
-	if (S_ISDIR(fromStat.st_mode)) {
-		// A link an older install left where the install now has a directory
-		// (e.g. usr/share/zoneinfo, a link to the host's, which Android lacks)
-		// gives way to the directory, as an older file gives way to a newer one.
-		if (destinationExists && S_ISLNK(toStat.st_mode) && compareTimespec(fromStat.st_mtim, toStat.st_mtim) == 1) {
-			if (unlink(toPath.c_str()) == -1) {
-				if (skipUnwritableEntry("replace the link", toPath)) {
-					return;
-				}
-				fprintf(stderr, "Failed to delete old link %s: %s\n", toPath.c_str(), strerror(errno));
-				abort();
-			}
-			destinationExists = false;
-		}
-		if (destinationExists && !S_ISDIR(toStat.st_mode)) {
-			return;
-		} else {
-			if (!destinationExists) {
-				if (mkdir(toPath.c_str(), fromStat.st_mode & ALLPERMS) == -1) {
-					if (skipUnwritableEntry("create the directory", toPath)) {
-						return;
-					}
-					fprintf(stderr, "Failed to create directory %s: %s\n", toPath.c_str(), strerror(errno));
-					abort();
-				}
-				updateAttributes = true;
-			}
-			DIR* fromDir = opendir(fromPath.c_str());
-			if (fromDir == NULL) {
-				fprintf(stderr, "Failed to open directory %s: %s\n", fromPath.c_str(), strerror(errno));
-				abort();
-			}
-
-			struct dirent* entry = NULL;
-			while ((errno = 0) || ((entry = readdir(fromDir)) != NULL)) {
-				if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-					continue;
-				}
-
-				size_t oldFromSize = fromPath.size();
-				size_t oldToSize = toPath.size();
-
-				fromPath.push_back('/');
-				toPath.push_back('/');
-
-				fromPath.append(entry->d_name);
-				toPath.append(entry->d_name);
-
-				copyAndSetAttributes(fromPath, toPath);
-
-				fromPath.resize(oldFromSize);
-				toPath.resize(oldToSize);
-			}
-
-			if (errno) {
-				fprintf(stderr, "Failed to read directory %s: %s\n", fromPath.c_str(), strerror(errno));
-				abort();
-			}
-
-			if (closedir(fromDir) == -1) {
-				fprintf(stderr, "Failed to close directory %s: %s\n", fromPath.c_str(), strerror(errno));
-			}
-		}
-	} else {
-		if (destinationExists) {
-			if ((fromStat.st_mode & S_IFMT) != (toStat.st_mode & S_IFMT)) {
-				return;
-			} else {
-				int compareResult = compareTimespec(fromStat.st_mtim, toStat.st_mtim);
-				// the lower file is older, don't touch the newer file.
-				if (compareResult == -1) {
-					return;
-				// the lower file and the newer files should be the same.
-				// we still update the attributes though, in case ownership or permission changes.
-				} else if (compareResult == 0) {
-					updateAttributes = true;
-				} else if (compareResult == 1) {
-					if (unlink(toPath.c_str()) == -1) {
-						if (skipUnwritableEntry("replace the file", toPath)) {
-							return;
-						}
-						fprintf(stderr, "Failed to delete old destination file %s: %s\n", toPath.c_str(), strerror(errno));
-						abort();
-					}
-					std::error_code ec;
-					std::filesystem::copy(fromPath, toPath, std::filesystem::copy_options::copy_symlinks, ec);
-					if (ec) { fprintf(stderr, "copy %s -> %s failed: %s\n", fromPath.c_str(), toPath.c_str(), ec.message().c_str()); return; }
-					updateAttributes = true;
-				}
-			}
-		} else {
-			std::error_code ec;
-			std::filesystem::copy(fromPath, toPath, std::filesystem::copy_options::copy_symlinks, ec);
-			if (ec) { fprintf(stderr, "copy %s -> %s failed: %s\n", fromPath.c_str(), toPath.c_str(), ec.message().c_str()); return; }
-			updateAttributes = true;
-		}
-	}
-
-	if (updateAttributes) {
-		struct timespec times[] = {
-			fromStat.st_atim,
-			fromStat.st_mtim
-		};
-		if (utimensat(-1, toPath.c_str(), times, AT_SYMLINK_NOFOLLOW) == -1) {
-			if (skipUnwritableEntry("set the timestamp", toPath)) {
-				return;
-			}
-			fprintf(stderr, "Failed to set timestamp for %s: %s\n", toPath.c_str(), strerror(errno));
-			abort();
-    	}
-		if (fchownat(-1, toPath.c_str(), fromStat.st_uid, fromStat.st_gid, AT_SYMLINK_NOFOLLOW) == -1) {
-			// The copy runs as the user, who cannot hand files to root; the prefix stays owned by the user instead.
-			if (errno != EPERM && errno != EINVAL) {
-				fprintf(stderr, "Failed to set owner for %s: %s\n", toPath.c_str(), strerror(errno));
-				abort();
-			}
-		}
-		// POSIX said that AT_SYMLINK_NOFOLLOW is acceptable for links, but on Linux all calls with AT_SYMLINK_NOFOLLOW fails with ENOTSUP.
-		if (fchmodat(-1, toPath.c_str(), fromStat.st_mode & ALLPERMS, S_ISLNK(fromStat.st_mode) ? AT_SYMLINK_NOFOLLOW : 0) == -1) {
-			if (!(S_ISLNK(fromStat.st_mode) && (errno == ENOTSUP)) && !skipUnwritableEntry("set the permissions", toPath)) {
-				fprintf(stderr, "Failed to set permissions for %s: %s\n", toPath.c_str(), strerror(errno));
-				abort();
-			}
-		}
-	}
-}
-
 static void temp_drop_privileges(uid_t uid, gid_t gid) {
-	if (geteuid() != 0) {
+	// without root there is nothing to drop; the ids are already the user's
+	if (!runningAsRoot()) {
 		return;
 	}
 	// it's important to drop GID first, because non-root users can't change their GID
@@ -1098,8 +860,27 @@ static bool dropTookEffect(uid_t uid, gid_t gid) {
 	       dropIdsMatch(uid, gid, ruid, euid, suid, rgid, egid, sgid);
 };
 
+// one byte over the socket pair between the server and launchd's process says "ready"
+static bool sendReadyByte(int fd) {
+	ssize_t ret;
+	do {
+		ret = write(fd, ".", 1);
+	} while (ret < 0 && errno == EINTR);
+	return ret == 1;
+};
+
+// false when the other side exited (or closed its end) without saying it is ready
+static bool readReadyByte(int fd) {
+	char byte;
+	ssize_t ret;
+	do {
+		ret = read(fd, &byte, 1);
+	} while (ret < 0 && errno == EINTR);
+	return ret == 1;
+};
+
 static void perma_drop_privileges(uid_t uid, gid_t gid) {
-	if (geteuid() != 0) {
+	if (!runningAsRoot()) {
 		return;
 	}
 	if (setresgid(gid, gid, gid) < 0) {
@@ -1117,11 +898,7 @@ static void perma_drop_privileges(uid_t uid, gid_t gid) {
 };
 
 static void regain_privileges() {
-	// temp_drop_privileges() leaves root only in the saved set-user-ID (real and effective
-	// are both the original user), so check all three: only a process that never had root
-	// (non-root mode) should skip regaining it.
-	uid_t ruid, euid, suid;
-	if (getresuid(&ruid, &euid, &suid) == 0 && ruid != 0 && euid != 0 && suid != 0) {
+	if (!runningAsRoot()) {
 		return;
 	}
 	if (seteuid(0) < 0) {
@@ -1143,14 +920,492 @@ static void regain_privileges() {
 	}
 };
 
-// Copies as the user, so that root never writes through links inside the user's prefix.
-static void copyLibexecIntoPrefix(const char* prefix, uid_t originalUID, gid_t originalGID) {
-	std::string fromPath = DarlingServer::Config::getLibexecPath();
-	std::string toPath = prefix;
-	temp_drop_privileges(originalUID, originalGID);
-	copyAndSetAttributes(fromPath, toPath);
+// Closes every descriptor from 3 up, except keep.
+static void closeInheritedFds(int keep) {
+#ifdef SYS_close_range
+	bool closed = true;
+	if (keep > 3) {
+		closed = syscall(SYS_close_range, 3, keep - 1, 0) == 0;
+	}
+	if (closed && syscall(SYS_close_range, (keep >= 3) ? keep + 1 : 3, ~0U, 0) == 0) {
+		return;
+	}
+#endif
+	// kernels before 5.9
+	std::vector<int> fds;
+	DIR* dir = opendir("/proc/self/fd");
+	if (!dir) {
+		fprintf(stderr, "Cannot list the inherited file descriptors: %s\n", strerror(errno));
+		exit(1);
+	}
+	while (struct dirent* ent = readdir(dir)) {
+		char* end;
+		long fd = strtol(ent->d_name, &end, 10);
+		if (*end == '\0' && end != ent->d_name && fd > STDERR_FILENO && fd != keep && fd != dirfd(dir)) {
+			fds.push_back(fd);
+		}
+	}
+	closedir(dir);
+	for (int fd: fds) {
+		close(fd);
+	}
+};
+
+// The umask the user started darling with; the user's own processes get it back.
+static mode_t userUmask = 022;
+
+// The launcher starts us as root, but with the process state the user started the launcher with.
+// Reset what could make the root part of the start-up act differently or stop half-way, or leave a
+// core file of a root process somewhere the user chose.
+static void sanitizeProcessState(int pipefd) {
+	// Missing standard descriptors would be taken by the files and directories opened as root below.
+	for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+		if (fcntl(fd, F_GETFD) < 0 && errno == EBADF) {
+			int null = open("/dev/null", O_RDWR);
+			if (null != fd) {
+				exit(1);
+			}
+		}
+	}
+
+	// The pipe to the launcher is the only other descriptor meant for us.
+	closeInheritedFds(pipefd);
+
+	// Ignored and blocked signals survive exec. An ignored SIGCHLD would make the waits for our own
+	// helper processes fail; others would change how a failure ends.
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (sig != SIGKILL && sig != SIGSTOP) {
+			signal(sig, SIG_DFL);
+		}
+	}
+	sigset_t none;
+	sigemptyset(&none);
+	sigprocmask(SIG_SETMASK, &none, NULL);
+
+	// No core file while we are root; the user's limit is restored (and raised) after the drop.
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+	struct rlimit core;
+	if (getrlimit(RLIMIT_CORE, &core) == 0) {
+		core.rlim_cur = 0;
+		setrlimit(RLIMIT_CORE, &core);
+	}
+
+	// Files root makes get the modes it asks for, and no relative path means the user's directory.
+	userUmask = umask(022);
+	if (chdir("/") != 0) {
+		fprintf(stderr, "Cannot change to /: %s\n", strerror(errno));
+		exit(1);
+	}
+};
+
+// The invoking user's supplementary groups, as the launcher passed them on.
+static std::vector<gid_t> userGroups;
+
+// Runs fn in a child process that has given up root for good, and waits for it. Work in the user's
+// prefix that root is not needed for runs like this, so that nothing it does can get root back.
+template<typename Fn>
+static bool runAsUser(uid_t uid, gid_t gid, Fn&& fn) {
+	fflush(stdout);
+	fflush(stderr);
+	pid_t pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "Cannot fork: %s\n", strerror(errno));
+		return false;
+	} else if (pid == 0) {
+		// Without root the process already has only the user's ids (or, in a user namespace, ids that
+		// stand for the user), and may not change the groups there; the separate process still keeps
+		// whatever fn does to its own state away from the server.
+		// the groups and gids first, while the uid can still change them
+		if (runningAsRoot() && (setgroups(userGroups.size(), userGroups.data()) != 0 || setresgid(gid, gid, gid) != 0 ||
+			setresuid(uid, uid, uid) != 0 || !dropTookEffect(uid, gid) || (uid != 0 && setresuid(-1, 0, -1) == 0)))
+		{
+			fprintf(stderr, "Cannot switch to your user and group ids\n");
+			_exit(1);
+		}
+		umask(userUmask);
+		_exit(fn() ? 0 : 1);
+	}
+
+	int status = 0;
+	while (waitpid(pid, &status, 0) != pid) {
+		if (errno != EINTR) {
+			fprintf(stderr, "Cannot wait for a child process: %s\n", strerror(errno));
+			return false;
+		}
+	}
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+};
+
+// Opens a path in or next to the user's prefix with the user's ids, so that it resolves exactly as
+// it would for the user, and nowhere the user could not go.
+static int openAsUser(int dirFd, const char* path, int flags, uid_t uid, gid_t gid) {
+	temp_drop_privileges(uid, gid);
+	int fd = openat(dirFd, path, flags | O_CLOEXEC);
+	int error = errno;
 	regain_privileges();
-}
+	errno = error;
+	return fd;
+};
+
+static std::string procFdPath(int fd) {
+	return "/proc/self/fd/" + std::to_string(fd);
+};
+
+// The prefix is a directory the user owns and can change at any time, also while root works in it.
+// So it is opened once, as the user, and checked; everything root does inside it from then on is
+// done relative to this descriptor, one name at a time and without following symbolic links, and the
+// prefix is mounted on through the descriptor rather than its path.
+struct PinnedPrefix {
+	std::string parent; // the directory holding the prefix
+	std::string name;   // the prefix's name in it
+	int fd = -1;
+};
+
+static PinnedPrefix pinPrefix(const char* prefix, uid_t uid, gid_t gid) {
+	PinnedPrefix pinned;
+
+	// Paths built from the prefix go into fixed-size buffers; the launcher allows far less than this.
+	if (strlen(prefix) > PATH_MAX / 2 || !DarlingServer::PrefixSetup::splitPath(prefix, pinned.parent, pinned.name)) {
+		fprintf(stderr, "darlingserver: the prefix must be an absolute path other than / and shorter than %d bytes: %s\n", PATH_MAX / 2, prefix);
+		exit(1);
+	}
+
+	// A symbolic link as the prefix's last component is resolved with the user's ids, and what it
+	// leads to is checked like any other prefix.
+	pinned.fd = openAsUser(AT_FDCWD, prefix, O_RDONLY | O_DIRECTORY, uid, gid);
+	if (pinned.fd < 0) {
+		fprintf(stderr, "Cannot open the prefix %s: %s\n", prefix, strerror(errno));
+		exit(1);
+	}
+
+	struct stat st;
+	if (fstat(pinned.fd, &st) != 0 || !DarlingServer::PrefixSetup::prefixDirAcceptable(st, uid, gid)) {
+		fprintf(stderr, "The prefix %s must be a directory that you own and that nobody else can write to\n", prefix);
+		exit(1);
+	}
+
+	return pinned;
+};
+
+// The overlay's work directory, in the "<prefix>.workdir" directory the launcher creates next to the
+// prefix. overlayfs and fuse-overlayfs create, empty and rename entries in it as root, so they get a
+// directory inside it that only root can use. Returns -1, after a message, if that is not possible.
+static int openOverlayWorkDir(const PinnedPrefix& prefix, uid_t uid, gid_t gid) {
+	static const char privateName[] = "private";
+	std::string workName = prefix.name + ".workdir";
+	struct stat st;
+
+	int parentFd = openAsUser(AT_FDCWD, prefix.parent.c_str(), O_PATH | O_DIRECTORY, uid, gid);
+	if (parentFd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n", prefix.parent.c_str(), strerror(errno));
+		return -1;
+	}
+	int workFd = openAsUser(parentFd, workName.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW, uid, gid);
+	int error = errno;
+	close(parentFd);
+	if (workFd < 0) {
+		fprintf(stderr, "Cannot open the work directory %s: %s\n", workName.c_str(), strerror(error));
+		return -1;
+	}
+	if (fstat(workFd, &st) != 0 || !DarlingServer::PrefixSetup::workDirAcceptable(st, uid)) {
+		fprintf(stderr, "The work directory %s must be a directory that you own and that nobody else can write to\n", workName.c_str());
+		close(workFd);
+		return -1;
+	}
+
+	if (mkdirat(workFd, privateName, 0700) != 0 && errno != EEXIST) {
+		fprintf(stderr, "Cannot create %s/%s: %s\n", workName.c_str(), privateName, strerror(errno));
+		close(workFd);
+		return -1;
+	}
+	int privateFd = openat(workFd, privateName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	error = errno;
+	close(workFd);
+	if (privateFd < 0 || fstat(privateFd, &st) != 0 || !DarlingServer::PrefixSetup::privateRootDirAcceptable(st)) {
+		fprintf(stderr, "%s/%s must be a directory that only root can use: %s\n", workName.c_str(), privateName, privateFd < 0 ? strerror(error) : "it is not");
+		if (privateFd >= 0) {
+			close(privateFd);
+		}
+		return -1;
+	}
+	return privateFd;
+};
+
+// Root's own directory for assembling the prefix, on the new /dev/shm that only this mount namespace
+// sees: nothing in a path below it can be renamed or replaced by the user.
+static const char setupDir[] = "/dev/shm/.darlingserver-setup";
+
+static bool makeSetupDir(const std::string& path) {
+	if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+		fprintf(stderr, "Cannot create %s: %s\n", path.c_str(), strerror(errno));
+		return false;
+	}
+	struct stat st;
+	if (lstat(path.c_str(), &st) != 0 || !DarlingServer::PrefixSetup::privateRootDirAcceptable(st)) {
+		fprintf(stderr, "%s is not a directory that only root can use\n", path.c_str());
+		return false;
+	}
+	return true;
+};
+
+static bool optionPathsArePlain(std::initializer_list<std::string> paths) {
+	for (const auto& path: paths) {
+		if (!DarlingServer::PrefixSetup::isPlainOptionPath(path)) {
+			fprintf(stderr, "Cannot use an overlay: overlay mount options cannot carry the path %s, which has ',', ':', '\\' or control characters\n", path.c_str());
+			return false;
+		}
+	}
+	return true;
+};
+
+// Opens the assembled prefix where it was mounted in the setup directory, then moves that mount onto
+// the prefix directory (named through its descriptor). Returns the descriptor of the assembled
+// prefix's root, or -1 after a message.
+static int moveOntoPrefix(const std::string& mountPoint, int prefixFd) {
+	int mergedFd = open(mountPoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (mergedFd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n", mountPoint.c_str(), strerror(errno));
+		return -1;
+	}
+	if (mount(mountPoint.c_str(), procFdPath(prefixFd).c_str(), NULL, MS_MOVE, NULL) != 0) {
+		fprintf(stderr, "Cannot move the assembled prefix into place: %s\n", strerror(errno));
+		close(mergedFd);
+		return -1;
+	}
+	return mergedFd;
+};
+
+// How the prefix is assembled on top of the read-only system image.
+enum class FsMode {
+	Overlayfs,
+	FuseOverlayfs,
+	Copy,
+};
+
+// The mode chosen for a prefix is recorded in this file at the root of the prefix by the darling client
+// (the plain-text values are "overlayfs", "fuse-overlayfs" and "copy").
+static const char fsModeFileName[] = ".darling-fsmode";
+
+static bool readRecordedFsMode(const char* prefix, int prefixFd, uid_t uid, gid_t gid, FsMode& mode) {
+	// The file is the user's: read it as the user, and only if it is a regular file.
+	int fd = openAsUser(prefixFd, fsModeFileName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, uid, gid);
+	if (fd < 0) {
+		return false;
+	}
+	struct stat st;
+	FILE* file = (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) ? fdopen(fd, "r") : NULL;
+	if (!file) {
+		close(fd);
+		return false;
+	}
+
+	char buffer[32] = {0};
+	bool haveLine = fgets(buffer, sizeof(buffer), file) != NULL;
+	fclose(file);
+	if (!haveLine) {
+		return false;
+	}
+
+	buffer[strcspn(buffer, "\r\n")] = '\0';
+
+	if (strcmp(buffer, "overlayfs") == 0) {
+		mode = FsMode::Overlayfs;
+	} else if (strcmp(buffer, "fuse-overlayfs") == 0) {
+		mode = FsMode::FuseOverlayfs;
+	} else if (strcmp(buffer, "copy") == 0) {
+		mode = FsMode::Copy;
+	} else {
+		fprintf(stderr, "Ignoring unknown filesystem mode \"%s\" recorded in %s/%s\n", buffer, prefix, fsModeFileName);
+		return false;
+	}
+	return true;
+};
+
+static FsMode resolveFsMode(const char* prefix, int prefixFd, uid_t uid, gid_t gid) {
+	// an explicit environment setting wins over everything else
+	if (testEnvVar("DARLING_NOOVERLAYFS")) {
+		return FsMode::Copy;
+	} else if (getenv("DARLING_NOOVERLAYFS")) {
+		return FsMode::Overlayfs;
+	}
+
+	FsMode recorded;
+	if (readRecordedFsMode(prefix, prefixFd, uid, gid, recorded)) {
+		return recorded;
+	}
+
+	// https://github.com/microsoft/WSL/issues/8748
+	// Microsoft is being dumb with its overlayfs implementation and they don't seem to be willing to be fix WSL1-related bugs.
+	// We therefore have to enable this hack on WSL1.
+	if (isOnWsl1()) {
+		return FsMode::Copy;
+	}
+
+	return FsMode::Overlayfs;
+};
+
+// Mounts the kernel's overlayfs with the prefix as its upper directory. The upper and work
+// directories are named through their descriptors, so the option string holds no path the user chose.
+static int mountOverlayfs(int prefixFd, int workFd) {
+	std::string merged = std::string(setupDir) + "/merged";
+	std::string upper = procFdPath(prefixFd);
+	std::string work = procFdPath(workFd);
+	if (!makeSetupDir(setupDir) || !makeSetupDir(merged) || !optionPathsArePlain({ DarlingServer::Config::libexecPath(), upper, work })) {
+		return -1;
+	}
+
+	std::string opts = "lowerdir=" + DarlingServer::Config::libexecPath() + ",upperdir=" + upper + ",workdir=" + work;
+	if (mount("overlay", merged.c_str(), "overlay", 0, (opts + ",index=off").c_str()) != 0 &&
+		(errno != EINVAL || mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()) != 0))
+	{
+		fprintf(stderr, "Cannot mount overlay: %s\n", strerror(errno));
+		return -1;
+	}
+
+	int mergedFd = moveOntoPrefix(merged, prefixFd);
+	if (mergedFd >= 0) {
+		rmdir(merged.c_str());
+		rmdir(setupDir);
+	}
+	return mergedFd;
+};
+
+// Unlike the kernel's overlayfs, fuse-overlayfs does not place restrictions on the filesystem holding the upper layer.
+// It takes paths, and resolves them again after starting, so it gets paths in root's setup directory,
+// where the prefix and the work directory are bind-mounted (through their descriptors) for as long as
+// the container runs.
+static int mountFuseOverlayfs(int prefixFd, int workFd) {
+	std::string upper = std::string(setupDir) + "/upper";
+	std::string work = std::string(setupDir) + "/work";
+	std::string merged = std::string(setupDir) + "/merged";
+	if (!makeSetupDir(setupDir) || !makeSetupDir(upper) || !makeSetupDir(work) || !makeSetupDir(merged) ||
+		!optionPathsArePlain({ DarlingServer::Config::libexecPath(), upper, work }))
+	{
+		return -1;
+	}
+	if (mount(procFdPath(prefixFd).c_str(), upper.c_str(), NULL, MS_BIND, NULL) != 0 ||
+		mount(procFdPath(workFd).c_str(), work.c_str(), NULL, MS_BIND, NULL) != 0)
+	{
+		fprintf(stderr, "Cannot bind-mount the prefix for fuse-overlayfs: %s\n", strerror(errno));
+		return -1;
+	}
+
+	std::string opts = "lowerdir=" + DarlingServer::Config::libexecPath() + ",upperdir=" + upper + ",workdir=" + work + ",allow_other";
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "Failed to fork to run fuse-overlayfs: %s\n", strerror(errno));
+		return -1;
+	} else if (pid == 0) {
+		// It runs as root: only a PATH of root's directories, as the launcher gives us.
+		static char* env[] = { (char*) "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NULL };
+		environ = env;
+		execlp("fuse-overlayfs", "fuse-overlayfs", "-o", opts.c_str(), merged.c_str(), NULL);
+		fprintf(stderr, "Failed to run fuse-overlayfs: %s\n", strerror(errno));
+		_exit(127);
+	}
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "Failed to wait for fuse-overlayfs: %s\n", strerror(errno));
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "fuse-overlayfs failed\n");
+		return -1;
+	}
+
+	return moveOntoPrefix(merged, prefixFd);
+};
+
+// Copies the system image into the prefix, as root so that the files keep their owners. Without root
+// the files cannot be given other owners, and belong to the user.
+// Returns the prefix's descriptor again, or -1.
+static int copyIntoPrefix(int prefixFd) {
+	const std::string& libexec = DarlingServer::Config::libexecPath();
+	int lowerFd = open(libexec.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (lowerFd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n", libexec.c_str(), strerror(errno));
+		return -1;
+	}
+	bool ok = DarlingServer::PrefixSetup::copyTree(lowerFd, prefixFd, runningAsRoot());
+	close(lowerFd);
+	if (!ok) {
+		fprintf(stderr, "Cannot copy %s into the prefix\n", libexec.c_str());
+		return -1;
+	}
+	return fcntl(prefixFd, F_DUPFD_CLOEXEC, 0);
+};
+
+// Gives the user their own copy of every directory of the system image, so that the directories of
+// the assembled prefix are theirs. Done once, when the prefix is created.
+static bool mirrorDirectoriesIntoPrefix(int prefixFd, uid_t uid, gid_t gid) {
+	return runAsUser(uid, gid, [prefixFd]() {
+		const std::string& libexec = DarlingServer::Config::libexecPath();
+		int lowerFd = open(libexec.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		if (lowerFd < 0) {
+			fprintf(stderr, "Cannot open %s: %s\n", libexec.c_str(), strerror(errno));
+			return false;
+		}
+		DarlingServer::PrefixSetup::mirrorDirectories(lowerFd, prefixFd);
+		close(lowerFd);
+		return true;
+	});
+};
+
+// What the prefix's /proc is in the unprivileged modes without a PID namespace of their own. launchd's
+// processes then share the host's process table, and the guest's /proc is the host's, reached through
+// the host root that every prefix links in as /Volumes/SystemRoot.
+static const char hostProcLinkTarget[] = "/Volumes/SystemRoot/proc";
+
+// NonRoot: makes the prefix's /proc a link to the host's. The prefix is the user's own copy and no
+// mount takes its place, so this is the whole setup. Everything is relative to the descriptor.
+static bool linkHostProc(int prefixFd) {
+	struct stat st;
+	if (fstatat(prefixFd, "proc", &st, AT_SYMLINK_NOFOLLOW) == 0) {
+		char current[sizeof(hostProcLinkTarget) + 1];
+		if (S_ISLNK(st.st_mode)) {
+			ssize_t len = readlinkat(prefixFd, "proc", current, sizeof(current) - 1);
+			if (len == (ssize_t)(sizeof(hostProcLinkTarget) - 1) && memcmp(current, hostProcLinkTarget, len) == 0) {
+				return true;
+			}
+		}
+		// an empty directory (what the copy brings along) or another link is replaced; a directory with
+		// contents is not the mount point the image holds, so it stays and the failure is reported
+		if (unlinkat(prefixFd, "proc", S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0) != 0) {
+			fprintf(stderr, "Cannot replace the prefix's /proc: %s\n", strerror(errno));
+			return false;
+		}
+	} else if (errno != ENOENT) {
+		fprintf(stderr, "Cannot look at the prefix's /proc: %s\n", strerror(errno));
+		return false;
+	}
+	if (symlinkat(hostProcLinkTarget, prefixFd, "proc") != 0) {
+		fprintf(stderr, "Cannot link the prefix's /proc to the host's: %s\n", strerror(errno));
+		return false;
+	}
+	return true;
+};
+
+// Root and Rootless: a prefix that was last run in the NonRoot mode has a link where the PID namespace's
+// procfs is to be mounted. Put the mount point back, as the user and before anything is mounted on
+// the prefix, so that the link cannot be followed by what root does next.
+static bool restoreProcMountPoint(int prefixFd, uid_t uid, gid_t gid) {
+	return runAsUser(uid, gid, [prefixFd]() {
+		struct stat st;
+		if (fstatat(prefixFd, "proc", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+			return errno == ENOENT;
+		}
+		if (!S_ISLNK(st.st_mode)) {
+			return true;
+		}
+		if (unlinkat(prefixFd, "proc", 0) != 0 || mkdirat(prefixFd, "proc", 0555) != 0) {
+			fprintf(stderr, "Cannot restore the prefix's /proc directory: %s\n", strerror(errno));
+			return false;
+		}
+		return true;
+	});
+};
 
 #if DSERVER_ASAN
 static void handle_sigusr1(int signum) {
@@ -1175,8 +1430,7 @@ int main(int argc, char** argv) {
 	int childWaitFDs[2];
 	struct rlimit core_limit;
 
-	char putOld[4096];
-	char *p;
+	int mergedFd = -1;
 
 	if (argc < 6) {
 		fprintf(stderr, "darlingserver is not meant to be started manually\n");
@@ -1200,17 +1454,67 @@ int main(int argc, char** argv) {
 		fix_permissions = true;
 	}
 
-	// Without trailing slashes, so the parent/name split works and ".workdir" is the prefix's sibling.
-	std::string prefixPath = prefix;
-	while (prefixPath.size() > 1 && prefixPath.back() == '/')
-		prefixPath.pop_back();
+	// What the kernel says this process may do decides the mode. Neither the arguments nor the
+	// environment can make it other than what it is, so a process with root's power is always in Root
+	// mode, whatever it is told. The user and group given only have to match the namespace's map for
+	// Rootless; given wrongly, they lead to Root, which needs root ids and drops to them.
+	runMode = DarlingServer::RunMode::detect(originalUID, originalGID);
 
+	if (runningAsRoot() && (getuid() != 0 || getgid() != 0)) {
+		fprintf(stderr, "darlingserver needs to start as root\n");
+		exit(1);
+	}
 
-	// temporarily drop privileges to perform some prefix work
-	temp_drop_privileges(originalUID, originalGID);
-	setupUserHome(prefix, originalUID);
+	// A directory other than the compiled-in one for the system image is taken only from a process
+	// that has no privileges of its own. Root mode, which assembles a prefix as root from that
+	// directory, always uses the installed one, so a user cannot make it load files of their choosing.
+	{
+		std::string libexec, libexecError;
+		if (!DarlingServer::RunMode::resolveLibexecPath(runMode, getenv("DARLING_LIBEXEC_PATH"), libexec, libexecError)) {
+			fprintf(stderr, "darlingserver: %s\n", libexecError.c_str());
+			exit(1);
+		}
+		DarlingServer::Config::setLibexecPath(libexec);
+		unsetenv("DARLING_LIBEXEC_PATH");
+	}
+
+	// Where mldr is, when it cannot live in the libexec tree (an Android app's native library
+	// directory). Like the libexec directory, it is taken only from a process that has no
+	// privileges of its own: Root mode executes mldr as root.
+	{
+		const char* mldrOverride = getenv("DARLING_MLDR_PATH");
+		if (runMode != DarlingServer::RunMode::Mode::Root && mldrOverride && mldrOverride[0] == '/') {
+			DarlingServer::Config::setMldrPath(mldrOverride);
+		}
+		unsetenv("DARLING_MLDR_PATH");
+	}
+
+	// The ids that own the user's files as this process sees them. In a user namespace the launcher
+	// maps the user to a single id, and the ids passed on the command line (the user's on the host) mean
+	// nothing there; without root the process has the user's own ids.
+	const uid_t userUID = runningAsRoot() ? originalUID : getuid();
+	const gid_t userGID = runningAsRoot() ? originalGID : getgid();
+
+	sanitizeProcessState(pipefd);
+
+	// the launcher starts us with the user's supplementary groups
+	int groupCount = getgroups(0, NULL);
+	if (groupCount >= 0) {
+		userGroups.resize(groupCount);
+		groupCount = getgroups(groupCount, userGroups.data());
+	}
+	if (groupCount < 0) {
+		fprintf(stderr, "Cannot read your supplementary groups: %s\n", strerror(errno));
+		exit(1);
+	}
+	userGroups.resize(groupCount);
+
+	// Set up /Users in the prefix. It needs no privileges and reads the user's own configuration, so
+	// it runs in a child that has dropped root for good.
+	if (!runAsUser(userUID, userGID, [prefix, originalUID]() { setupUserHome(prefix, originalUID); return true; })) {
+		exit(1);
+	}
 	//setupCoredumpPattern();
-	regain_privileges();
 
 	// read the default rlimit so we can restore it for our children
 	if (getrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
@@ -1223,17 +1527,15 @@ int main(int argc, char** argv) {
 		// read the system maximum
 		nr_open_file = fopen("/proc/sys/fs/nr_open", "r");
 		if (nr_open_file == NULL) {
-			if (geteuid() == 0 && errno != EACCES && errno != EPERM)
-				fprintf(stderr, "Warning: failed to open /proc/sys/fs/nr_open: %s\n", strerror(errno));
+			fprintf(stderr, "Warning: failed to open /proc/sys/fs/nr_open: %s\n", strerror(errno));
 			increased_limit.rlim_cur = increased_limit.rlim_max = default_limit.rlim_max;
 			//exit(1);
 		} else {
-			unsigned long read_max = 0;
-			if (fscanf(nr_open_file, "%lu", &read_max) == 1) {
-				increased_limit.rlim_cur = increased_limit.rlim_max = read_max;
-			} else {
-				increased_limit.rlim_cur = increased_limit.rlim_max = default_limit.rlim_max;
+			if (fscanf(nr_open_file, "%lu", &increased_limit.rlim_max) != 1) {
+				fprintf(stderr, "Failed to read /proc/sys/fs/nr_open: %s\n", strerror(errno));
+				exit(1);
 			}
+			increased_limit.rlim_cur = increased_limit.rlim_max;
 			if (fclose(nr_open_file) != 0) {
 				fprintf(stderr, "Failed to close /proc/sys/fs/nr_open: %s\n", strerror(errno));
 				exit(1);
@@ -1255,41 +1557,40 @@ int main(int argc, char** argv) {
 #endif
 	}
 
+	// the core limit is raised to the maximum once we are no longer root
 	if (getrlimit(RLIMIT_CORE, &core_limit) != 0) {
 		fprintf(stderr, "Failed to read default core rlimit: %s\n", strerror(errno));
+		core_limit.rlim_cur = core_limit.rlim_max = 0;
 	} else {
-		// increase the core limit to the maximum
 		core_limit.rlim_cur = core_limit.rlim_max;
+	}
 
-		if (setrlimit(RLIMIT_CORE, &core_limit) != 0) {
-			fprintf(stderr, "Warning: failed to increase core limit: %s\n", strerror(errno));
+	// NonRoot has no namespaces and cannot mount anything: the prefix is a copy and /dev/shm is the host's.
+	if (runMode != DarlingServer::RunMode::Mode::NonRoot)
+	{
+		// Since overlay cannot be mounted inside user namespaces, we have to setup a new mount namespace
+		// and do the mount while we can be root
+		if (unshare(CLONE_NEWNS) != 0)
+		{
+			fprintf(stderr, "Cannot unshare PID and mount namespaces: %s\n", strerror(errno));
+			exit(1);
 		}
-	}
 
-	// Setup mount namespace if root
-	if (geteuid() == 0 && unshare(CLONE_NEWNS) != 0)
-	{
-		fprintf(stderr, "Cannot unshare PID and mount namespaces: %s\n", strerror(errno));
-		exit(1);
-	}
+		// systemd marks / as MS_SHARED and the new namespace inherits that, so without this the
+		// /dev/shm tmpfs and overlay mounts below would propagate back into the host's namespace.
+		if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0)
+		{
+			fprintf(stderr, "Cannot remount / as slave: %s\n", strerror(errno));
+			exit(1);
+		}
 
-	// systemd marks / as MS_SHARED and the new namespace inherits that, so without this the
-	// /dev/shm tmpfs and overlay mounts below would propagate back into the host's namespace.
-	if (geteuid() == 0 && mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0)
-	{
-		fprintf(stderr, "Cannot remount / as slave: %s\n", strerror(errno));
-		exit(1);
-	}
+		int shmMountFlags = MS_NOSUID | MS_NODEV;
+		// Workaround for dumb Microsoft bug: https://github.com/microsoft/WSL/issues/8777
+		if (!isOnWsl1())
+		{
+			shmMountFlags |= MS_NOEXEC;
+		}
 
-	int shmMountFlags = MS_NOSUID | MS_NODEV;
-	// Workaround for dumb Microsoft bug: https://github.com/microsoft/WSL/issues/8777
-	if (!isOnWsl1())
-	{
-		shmMountFlags |= MS_NOEXEC;
-	}
-
-	if (geteuid() == 0)
-	{
 		umount("/dev/shm");
 		if (mount("tmpfs", "/dev/shm", "tmpfs", shmMountFlags, NULL) != 0)
 		{
@@ -1298,76 +1599,48 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	if (shouldUseOverlayFs() && geteuid() == 0) {
-		// Overlayfs writes into the upper and work directories as root, so mount through
-		// descriptors checked to be the user's own directories, not through their paths.
-		// Both come from one parent descriptor, so the work directory really is the prefix's sibling.
-		size_t slash = prefixPath.rfind('/');
-		std::string parentPath = slash == std::string::npos ? "." : (slash == 0 ? "/" : prefixPath.substr(0, slash));
-		std::string upperName = prefixPath.substr(slash + 1);
-		temp_drop_privileges(originalUID, originalGID);
-		int parentFD = open(parentPath.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-		if (parentFD < 0) {
-			fprintf(stderr, "Cannot open directory %s: %s\n", parentPath.c_str(), strerror(errno));
-			exit(1);
-		}
-		regain_privileges();
-		int upperFD = openPrefixDir(parentFD, upperName.c_str(), O_NOFOLLOW, false, originalUID, originalGID);
-		// The launcher creates .workdir, so it is never a symlink; launchers before the
-		// user-owned prefix changes created it as root.
-		int workFD = openPrefixDir(parentFD, (upperName + ".workdir").c_str(), O_NOFOLLOW, true, originalUID, originalGID);
-		close(parentFD);
-		std::string libexec = DarlingServer::Config::getLibexecPath();
-		// lowerdir is the only path formatted into the option string; upperdir and workdir are /proc/self/fd paths.
-		if (!isValidOverlayOptionPath(libexec.c_str())) {
-			fprintf(stderr, "Cannot mount overlay: the libexec path (%s) must not contain ',', ':', '\\' or control characters\n", libexec.c_str());
-			exit(1);
-		}
+	// Pin the prefix only now, inside the new mount namespace. A descriptor opened before unshare()
+	// refers to a mount of the host's namespace, and the kernel takes an overlay upper directory and
+	// an MS_MOVE target named through /proc/self/fd only from the caller's own namespace. Nothing
+	// above follows a path the user controls as root: unshare() and the / and /dev/shm mounts name
+	// root-owned host paths only, and /Users is set up with the user's ids.
+	PinnedPrefix pinnedPrefix = pinPrefix(prefix, userUID, userGID);
+	const int prefixFd = pinnedPrefix.fd;
 
-		// On prefix creation, give the user their own copies of the lower directories.
-		if (fix_permissions) {
-			temp_drop_privileges(originalUID, originalGID);
-			int lowerFD = open(libexec.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-			if (lowerFD < 0) {
-				fprintf(stderr, "Cannot open directory %s: %s\n", libexec.c_str(), strerror(errno));
-				exit(1);
-			}
-			mirrorDirectoryTree(lowerFD, upperFD);
-			regain_privileges();
-		}
+	// Without a mount namespace there is nothing to overlay the prefix with.
+	FsMode fsMode = (runMode == DarlingServer::RunMode::Mode::NonRoot) ? FsMode::Copy : resolveFsMode(prefix, prefixFd, userUID, userGID);
 
-		// Overlayfs empties an existing work/ in its workdir as root, so give it a directory only root can write to.
-		const char overlayWorkName[] = "darlingserver";
-		if (mkdirat(workFD, overlayWorkName, 0700) != 0 && errno != EEXIST) {
-			fprintf(stderr, "Cannot create %s.workdir/%s: %s\n", upperName.c_str(), overlayWorkName, strerror(errno));
-			exit(1);
-		}
-		int overlayWorkFD = openat(workFD, overlayWorkName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-		struct stat overlayWorkStat;
-		if (overlayWorkFD < 0 || fstat(overlayWorkFD, &overlayWorkStat) != 0
-			|| overlayWorkStat.st_uid != 0 || (overlayWorkStat.st_mode & 077) != 0)
-		{
-			fprintf(stderr, "%s.workdir/%s is not a private root directory\n", upperName.c_str(), overlayWorkName);
-			exit(1);
-		}
-		close(workFD);
+	// This is executed once at prefix creation. The directories are created in the prefix itself, which
+	// is the upper layer of the overlay modes, before anything is mounted on it.
+	if (fix_permissions && !mirrorDirectoriesIntoPrefix(prefixFd, userUID, userGID)) {
+		fprintf(stderr, "Cannot create the prefix's directories\n");
+		exit(1);
+	}
 
-		std::string target = "/proc/self/fd/" + std::to_string(upperFD);
-		std::string opts = "lowerdir=" + libexec
-			+ ",upperdir=" + target
-			+ ",workdir=/proc/self/fd/" + std::to_string(overlayWorkFD);
+	if (runMode != DarlingServer::RunMode::Mode::NonRoot && !restoreProcMountPoint(prefixFd, userUID, userGID)) {
+		exit(1);
+	}
 
-		if (mount("overlay", target.c_str(), "overlay", 0, (opts + ",index=off").c_str()) != 0
-			&& (errno != EINVAL || mount("overlay", target.c_str(), "overlay", 0, opts.c_str()) != 0))
-		{
-			fprintf(stderr, "Cannot mount overlay: %s; falling back to direct copy\n", strerror(errno));
-			copyLibexecIntoPrefix((prefixPath + "/").c_str(), originalUID, originalGID);
+	// Failing to assemble the prefix exits with EX_UNAVAILABLE, which lets the darling client offer a different mode.
+	if (fsMode == FsMode::Overlayfs || fsMode == FsMode::FuseOverlayfs) {
+		int workFd = openOverlayWorkDir(pinnedPrefix, userUID, userGID);
+		if (workFd < 0) {
+			exit(EX_UNAVAILABLE);
 		}
-
-		close(upperFD);
-		close(overlayWorkFD);
+		mergedFd = (fsMode == FsMode::Overlayfs) ? mountOverlayfs(prefixFd, workFd) : mountFuseOverlayfs(prefixFd, workFd);
+		close(workFd);
+		if (mergedFd < 0) {
+			fprintf(stderr, "Cannot mount %s onto %s\n", (fsMode == FsMode::Overlayfs) ? "an overlay" : "fuse-overlayfs", prefix);
+			exit(EX_UNAVAILABLE);
+		}
 	} else {
-		copyLibexecIntoPrefix((prefixPath + "/").c_str(), originalUID, originalGID);
+		mergedFd = copyIntoPrefix(prefixFd);
+		if (mergedFd < 0) {
+			exit(1);
+		}
+		if (runMode == DarlingServer::RunMode::Mode::NonRoot && !linkHostProc(mergedFd)) {
+			exit(1);
+		}
 	}
 
 	// temporarily drop privileges and do some prefix work
@@ -1379,18 +1652,23 @@ int main(int argc, char** argv) {
 	write(pipefd, ".", 1);
 	close(pipefd);
 
-	// The child reports that its namespace is set up through [0]; the parent gives it the green light through [1].
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, childWaitFDs) != 0) {
-		std::cerr << "Failed to create child waiting socket pair: " << strerror(errno) << std::endl;
+	setsid();
+
+	// launchd's process reports through [0] that its setup is done; the server gives it the green light through [1].
+	// Either side sees end-of-file instead if the other one exits first.
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, childWaitFDs) != 0) {
+		std::cerr << "Failed to create the socket pair for launchd's process: " << strerror(errno) << std::endl;
 		exit(1);
 	}
 
 	// we have to use `clone` rather than `fork` to create the process in its own PID namespace
 	// and still be able to spawn new processes and threads of our own
-	launchdGlobalPID = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0);
-
-	if (launchdGlobalPID < 0) {
+	// NonRoot cannot create namespaces: launchd's process is then an ordinary child, and shares the host's
+	// process table.
+	if (runMode == DarlingServer::RunMode::Mode::NonRoot) {
 		launchdGlobalPID = fork();
+	} else {
+		launchdGlobalPID = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0);
 	}
 
 	if (launchdGlobalPID < 0) {
@@ -1398,8 +1676,6 @@ int main(int argc, char** argv) {
 		exit(1);
 	} else if (launchdGlobalPID == 0) {
 		// this is the child
-		char buf[1];
-
 		close(childWaitFDs[1]);
 
 		// Detach launchd into its own session + process group, so that any
@@ -1408,35 +1684,32 @@ int main(int argc, char** argv) {
 		// timeout (which all share the same pgrp by default). On ARM64 we
 		// observed launchd's startup broadcasting SIGTRAP, killing the parents.
 		if (setsid() == (pid_t)-1) {
-			if (errno != EPERM)
-				fprintf(stderr, "Warning: setsid() failed before launchd: %s\n", strerror(errno));
+			fprintf(stderr, "Warning: setsid() failed before launchd: %s\n", strerror(errno));
 			// continue anyway
 		}
 
-		if (geteuid() == 0)
+		// mount procfs for our new PID namespace, on the assembled prefix's /proc (through descriptors);
+		// NonRoot has no namespace of its own, and the prefix's /proc is the link to the host's
+		if (runMode != DarlingServer::RunMode::Mode::NonRoot)
 		{
-			// mount procfs for our new PID namespace, through the user's prefix rather than its path
-			int prefixFD = openPrefixDir(AT_FDCWD, prefixPath.c_str(), O_NOFOLLOW, false, originalUID, originalGID);
-			int procFD = openat(prefixFD, "proc", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-			snprintf(putOld, sizeof(putOld), "/proc/self/fd/%d", procFD);
-			if (procFD < 0 || mount("proc", putOld, "proc", 0, "") != 0)
+			int procFd = openat(mergedFd, "proc", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			if (procFd < 0 || mount("proc", procFdPath(procFd).c_str(), "proc", 0, "") != 0)
 			{
-				fprintf(stderr, "Cannot mount procfs on %s/proc, which must be a directory: %s\n", prefix, strerror(errno));
+				fprintf(stderr, "Cannot mount procfs: %s\n", strerror(errno));
 				exit(1);
 			}
-			if (procFD >= 0)
-				close(procFD);
-			close(prefixFD);
+			close(procFd);
 		}
-		else
-		{
-			ensureProcSymlink(prefix);
-		}
-		write(childWaitFDs[0], ".", 1);
+		close(mergedFd);
+		close(prefixFd);
 
 		// drop our privileges now
 		perma_drop_privileges(originalUID, originalGID);
 		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+		umask(userUmask);
+		if (setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+			fprintf(stderr, "Warning: failed to increase core limit for launchd: %s\n", strerror(errno));
+		}
 
 		// decrease the FD limit back to the default
 		if (setrlimit(RLIMIT_NOFILE, &default_limit) != 0) {
@@ -1444,9 +1717,35 @@ int main(int argc, char** argv) {
 			//exit(1);
 		}
 
-		// wait for the parent to give us the green light
-		read(childWaitFDs[0], buf, 1);
+		// launchd is the first process of the container's pid namespace; when it dies, the kernel
+		// kills every other process in the container. Tie its life to ours, so that the container
+		// does not outlive the server that every process in it talks to.
+		// This has to come after the privilege drop above: changing ids clears the parent-death signal.
+		// There is no getppid() check for a server that died before this point: our parent is outside
+		// the namespace and getppid() returns 0 here. The end-of-file check on the socket pair below
+		// covers that case.
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+			fprintf(stderr, "Warning: failed to tie launchd to the server's life: %s\n", strerror(errno));
+		}
+
+		// tell the parent that our namespace is set up
+		if (!sendReadyByte(childWaitFDs[0])) {
+			exit(1);
+		}
+
+		// wait for the parent to give us the green light; without it, the server is not there
+		if (!readReadyByte(childWaitFDs[0])) {
+			fprintf(stderr, "darlingserver did not start; not starting launchd\n");
+			exit(1);
+		}
 		close(childWaitFDs[0]);
+
+		// Without a PID namespace, daemons that detach from their parents would be adopted by the host's
+		// init and escape the container. As the subreaper they stay below launchd in the process tree,
+		// which is how the launcher finds the container's processes to end. The setting survives exec.
+		if (runMode == DarlingServer::RunMode::Mode::NonRoot && prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+			fprintf(stderr, "Warning: cannot make launchd a subreaper: %s\n", strerror(errno));
+		}
 
 		spawnLaunchd(prefix);
 		__builtin_unreachable();
@@ -1454,8 +1753,11 @@ int main(int argc, char** argv) {
 
 	// this is the parent
 	close(childWaitFDs[0]);
-	char childStatus;
-	if (read(childWaitFDs[1], &childStatus, 1) != 1) {
+	close(mergedFd);
+	close(prefixFd);
+
+	// without launchd there is nothing to serve: every launcher call would wait for it in vain
+	if (!readReadyByte(childWaitFDs[1])) {
 		fprintf(stderr, "launchd's process failed to set up its namespace\n");
 		exit(1);
 	}
@@ -1463,8 +1765,15 @@ int main(int argc, char** argv) {
 	// drop our privileges
 	perma_drop_privileges(originalUID, originalGID);
 	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+	umask(userUmask);
+	if (setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+		fprintf(stderr, "Warning: failed to increase core limit: %s\n", strerror(errno));
+	}
 
-	// Ignore SIGPIPE so closed sockets/pipes return EPIPE instead of killing the server
+	// a client can exit while we are writing to one of its pipes or sockets;
+	// that must fail with EPIPE instead of killing the server.
+	// this is done only here, after launchd's process has been created, because an ignored
+	// SIGPIPE survives execve() and launchd (and every process it spawns) must start with the default.
 	signal(SIGPIPE, SIG_IGN);
 
 #if DSERVER_ASAN
@@ -1476,11 +1785,16 @@ int main(int argc, char** argv) {
 	sigaction(SIGUSR1, &leak_info_action, NULL);
 #endif
 
+	// our IDs no longer change, so the credentials sent with every message can be cached
+	DarlingServer::Message::initializeServerCredentials();
+
 	// create the server
 	auto server = new DarlingServer::Server(prefix);
 
+	detachStdio();
+
 	// tell the child to go ahead; the socket has been created
-	write(childWaitFDs[1], ".", 1);
+	sendReadyByte(childWaitFDs[1]);
 	close(childWaitFDs[1]);
 
 	// start the main loop

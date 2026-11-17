@@ -27,8 +27,41 @@
 #include <system_error>
 #include <darlingserver/logging.hpp>
 #include <cstring>
+#include <optional>
+#include <pthread.h>
 
 static DarlingServer::Log messageLog("message");
+
+// set by Message::initializeServerCredentials(); written once before any other thread exists
+static std::optional<struct ucred> cachedCredentials;
+
+static struct ucred outgoingCredentials() {
+	if (cachedCredentials) {
+		return *cachedCredentials;
+	}
+
+	struct ucred creds;
+	creds.pid = getpid();
+	creds.uid = getuid();
+	creds.gid = getgid();
+	return creds;
+};
+
+void DarlingServer::Message::initializeServerCredentials() {
+	if (cachedCredentials) {
+		throw std::logic_error("Server credentials already initialized");
+	}
+
+	// a forked child has a different PID and must not send the parent's
+	int result = pthread_atfork(nullptr, nullptr, []() {
+		cachedCredentials.reset();
+	});
+	if (result != 0) {
+		throw std::system_error(result, std::generic_category(), "Failed to register fork handler for the server credentials");
+	}
+
+	cachedCredentials = outgoingCredentials();
+};
 
 DarlingServer::Address::Address() {
 	_address.sun_family = AF_UNIX;
@@ -60,6 +93,9 @@ void DarlingServer::Address::setRawSize(size_t newRawSize) {
 DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std::function<void()> sendNotificationCallback):
 	_sendNotificationCallback(sendNotificationCallback)
 {
+	// allocate the data buffer first: if that throws, the destructor does not run and would not free the control buffer
+	_buffer.resize(bufferSpace);
+
 	size_t controlLen = CMSG_SPACE(sizeof(struct ucred)) + (descriptorSpace > 0 ? CMSG_SPACE(sizeof(int) * descriptorSpace) : 0);
 	_controlHeader = static_cast<decltype(_controlHeader)>(malloc(controlLen));
 
@@ -70,10 +106,7 @@ DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std:
 	_controlHeader->cmsg_len = CMSG_LEN(sizeof(struct ucred));
 	_controlHeader->cmsg_level = SOL_SOCKET;
 	_controlHeader->cmsg_type = SCM_CREDENTIALS;
-	struct ucred ourCreds;
-	ourCreds.pid = getpid();
-	ourCreds.uid = getuid();
-	ourCreds.gid = getgid();
+	struct ucred ourCreds = outgoingCredentials();
 	// the cmsg man page says memcpy should be used with CMSG_DATA instead of direct pointer access
 	memcpy(CMSG_DATA(_controlHeader), &ourCreds, sizeof(ourCreds));
 
@@ -87,8 +120,6 @@ DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std:
 			memcpy(CMSG_DATA(fdHeader) + (sizeof(int) * i), &fd, sizeof(int));
 		}
 	}
-
-	_buffer.resize(bufferSpace);
 
 	_header.msg_name = &_socketAddress.raw();
 	_header.msg_namelen = _socketAddress.rawSize();
@@ -353,10 +384,7 @@ void DarlingServer::Message::_ensureCredentialsHeader() {
 	credHeader->cmsg_level = SOL_SOCKET;
 	credHeader->cmsg_type = SCM_CREDENTIALS;
 
-	struct ucred creds;
-	creds.pid = getpid();
-	creds.uid = getuid();
-	creds.gid = getgid();
+	struct ucred creds = outgoingCredentials();
 	memcpy(CMSG_DATA(credHeader), &creds, sizeof(struct ucred));
 };
 
@@ -490,6 +518,42 @@ void DarlingServer::MessageQueue::push(Message&& message) {
 	}
 };
 
+void DarlingServer::MessageQueue::_notifyIfNotEmpty() {
+	std::unique_lock lock(_lock);
+
+	if (_messages.empty()) {
+		return;
+	}
+
+	auto callback = _messageArrivalNotificationCallback;
+	lock.unlock();
+	if (callback) {
+		callback();
+	}
+};
+
+void DarlingServer::MessageQueue::pushAndSend(Message&& message, int socket) {
+	{
+		std::scoped_lock lock(_lock);
+		_messages.push_back(std::move(message));
+	}
+
+	bool canSendMore;
+
+	try {
+		canSendMore = sendMany(socket);
+	} catch (...) {
+		// the messages are still queued; let the owner retry (and see the error) on its side
+		_notifyIfNotEmpty();
+		throw;
+	}
+
+	if (!canSendMore) {
+		// the socket is full; the owner has to send the rest once it is writable again
+		_notifyIfNotEmpty();
+	}
+};
+
 std::optional<DarlingServer::Message> DarlingServer::MessageQueue::pop() {
 	std::scoped_lock lock(_lock);
 	if (_messages.size() > 0) {
@@ -572,18 +636,22 @@ bool DarlingServer::MessageQueue::sendMany(int socket) {
 bool DarlingServer::MessageQueue::receiveMany(int socket) {
 	bool canReadMore = true;
 	std::unique_lock lock(_lock);
-	struct mmsghdr mmsgs[16];
+	struct mmsghdr mmsgs[std::tuple_size<decltype(_receiveSlots)>::value];
 	int ret = 0;
 
 	while (ret >= 0) {
-		std::array<Message, sizeof(mmsgs) / sizeof(*mmsgs)> messages;
-
-		for (size_t i = 0; i < messages.size(); ++i) {
-			mmsgs[i].msg_hdr = messages[i].rawHeader();
+		for (size_t i = 0; i < _receiveSlots.size(); ++i) {
+			if (!_receiveSlots[i]) {
+				_receiveSlots[i].emplace();
+			}
+			mmsgs[i].msg_hdr = _receiveSlots[i]->rawHeader();
 			mmsgs[i].msg_len = 0;
 		}
 
 		ret = recvmmsg(socket, mmsgs, sizeof(mmsgs) / sizeof(*mmsgs), MSG_CMSG_CLOEXEC | MSG_DONTWAIT, nullptr);
+
+		// a short batch means the socket was drained; the listener is edge-triggered, so anything arriving later wakes us again
+		bool drained = ret >= 0 && (size_t)ret < sizeof(mmsgs) / sizeof(*mmsgs);
 
 		if (ret < 0) {
 			if (errno == EAGAIN) {
@@ -596,16 +664,41 @@ bool DarlingServer::MessageQueue::receiveMany(int socket) {
 			}
 		}
 
-		for (size_t i = 0; i < ret; ++i) {
-			messages[i].rawHeader() = mmsgs[i].msg_hdr;
+		size_t received = ret;
+
+		// give every received message its header before anything below can throw,
+		// so that each one owns the descriptors it carries
+		for (size_t i = 0; i < received; ++i) {
+			_receiveSlots[i]->rawHeader() = mmsgs[i].msg_hdr;
+		}
+
+		// the slots that received a message are emptied in any case (moved into the queue, dropped, or on an exception),
+		// which also closes the descriptors of a message that is not queued
+		struct SlotRelease {
+			decltype(_receiveSlots)& slots;
+			size_t count;
+			~SlotRelease() {
+				for (size_t i = 0; i < count; ++i) {
+					slots[i].reset();
+				}
+			};
+		} release { _receiveSlots, received };
+
+		for (size_t i = 0; i < received; ++i) {
+			auto& message = *_receiveSlots[i];
 			if (mmsgs[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
 				// body or descriptor set did not fit; dropping it here lets its destructor close the received descriptors
 				messageLog.warning() << "Dropping incoming message that did not fit the receive buffer (flags " << mmsgs[i].msg_hdr.msg_flags << ")" << messageLog.endLog;
 				continue;
 			}
-			messages[i].data().resize(mmsgs[i].msg_len);
-			messages[i].setAddress(Address(*(const struct sockaddr_un*)mmsgs[i].msg_hdr.msg_name, mmsgs[i].msg_hdr.msg_namelen));
-			_messages.push_back(std::move(messages[i]));
+			message.data().resize(mmsgs[i].msg_len);
+			message.setAddress(Address(*(const struct sockaddr_un*)mmsgs[i].msg_hdr.msg_name, mmsgs[i].msg_hdr.msg_namelen));
+			_messages.push_back(std::move(message));
+		}
+
+		if (drained) {
+			canReadMore = false;
+			break;
 		}
 	}
 

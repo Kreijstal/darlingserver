@@ -283,9 +283,8 @@ timer_call_entry_dequeue(
 {
 	mpqueue_head_t  *old_mpqueue = mpqueue_for_timer_call(entry);
 
-	if (old_mpqueue == NULL) {
-		return NULL;
-	}
+	/* The entry was always on a queue */
+	assert(old_mpqueue != NULL);
 
 #if TIMER_ASSERT
 	if (!hw_lock_held((hw_lock_t)&entry->tc_lock)) {
@@ -389,6 +388,11 @@ timer_call_entry_enqueue_deadline(
 		old_mpqueue->count--;
 	}
 	new_mpqueue->count++;
+
+#ifdef __DARLING__
+	// Arm the timer for the actual head of the queue, under the queue lock.
+	timer_queue_cancel(new_mpqueue, deadline, thead->tc_pqlink.deadline);
+#endif
 
 	return old_mpqueue;
 }
@@ -1024,6 +1028,9 @@ timer_queue_expire_with_options(
 		queue->earliest_soft_deadline = cur_deadline = UINT64_MAX;
 	}
 
+#ifdef __DARLING__
+	timer_queue_cancel(queue, deadline, cur_deadline);
+#endif
 	timer_queue_unlock(queue);
 
 	return cur_deadline;

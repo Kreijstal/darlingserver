@@ -97,10 +97,6 @@ int cpu_number(void) {
 	return 0;
 };
 
-void fileport_releasefg(struct fileglob* fg) {
-	dtape_stub();
-};
-
 void workq_deallocate_safe(struct workqueue* wq) {
 	dtape_stub();
 };
@@ -136,11 +132,11 @@ void suid_cred_notify(mach_msg_header_t* msg) {
 };
 
 boolean_t ml_get_interrupts_enabled(void) {
-	return FALSE;
+	return TRUE;
 };
 
 boolean_t ml_set_interrupts_enabled(boolean_t enable) {
-	return FALSE;
+	return TRUE;
 };
 
 boolean_t ml_delay_should_spin(uint64_t interval) {
@@ -210,11 +206,17 @@ kern_return_t kmod_get_info(host_t host, kmod_info_array_t* kmod_list, mach_msg_
 };
 
 kern_return_t kext_request(host_priv_t hostPriv, uint32_t clientLogSpec, vm_offset_t requestIn, mach_msg_type_number_t requestLengthIn, vm_offset_t* responseOut, mach_msg_type_number_t* responseLengthOut, vm_offset_t* logDataOut, mach_msg_type_number_t* logDataLengthOut, kern_return_t* op_result) {
-	dtape_stub_unsafe();
+	// there are no kernel extensions to query or load
+	dtape_stub_safe();
+	return KERN_NOT_SUPPORTED;
 };
 
-uint32_t PE_i_can_has_debugger(uint32_t* something) {
-	dtape_stub_unsafe();
+uint32_t PE_i_can_has_debugger(uint32_t* debug_flags) {
+	// there is no kernel debugger
+	if (debug_flags) {
+		*debug_flags = 0;
+	}
+	return 0;
 };
 
 bool work_interval_port_type_render_server(mach_port_name_t port_name) {

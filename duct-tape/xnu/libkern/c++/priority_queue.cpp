@@ -134,11 +134,7 @@ struct pqueue {
 	static inline entry_t
 	unpack_child(entry_t e)
 	{
-#if defined(__LP64__) && !defined(__DARLING__)
-		return (entry_t)((uintptr_t)e->child & 0x0000ffffffffffffULL);
-#else
 		return (entry_t)e->child;
-#endif
 	}
 
 private:
@@ -233,12 +229,7 @@ private:
 	static inline void
 	list_remove(entry_t elt)
 	{
-		/* In darlingserver duct-tape emulation, an element may be removed
-		 * multiple times during Mach IPC / task teardown. elt->prev is NULL
-		 * for unlinked/detached elements; safely ignore double-removal. */
-		if (elt == NULL || elt->prev == NULL) {
-			return;
-		}
+		assert(elt->prev != NULL);
 		/* Check if elt is head of list at its level;        */
 		/* If yes, make the next node the head at that level */
 		/* Else, remove elt from the list at that level      */
@@ -256,12 +247,6 @@ private:
 	static inline bool
 	sift_down(queue_t que, entry_t elt)
 	{
-		if (elt == NULL) {
-			return false;
-		}
-		if (elt != que->pq_root && elt->prev == NULL) {
-			return false;
-		}
 		bool was_root = remove(que, elt);
 		insert(que, elt);
 		return was_root;
@@ -270,14 +255,8 @@ private:
 	static inline bool
 	sift_up(queue_t que, entry_t elt)
 	{
-		if (elt == NULL) {
-			return false;
-		}
 		if (elt == que->pq_root) {
 			return true;
-		}
-		if (elt->prev == NULL) {
-			return false;
 		}
 
 		/* Remove the element from its current level list */
@@ -357,19 +336,12 @@ public:
 	static inline bool
 	remove(queue_t que, entry_t elt)
 	{
-		if (elt == NULL) {
-			return false;
-		}
 		if (elt == que->pq_root) {
 			remove_root(que, elt);
 			elt->next = elt->prev = NULL;
 			elt->child = 0;
 			return true;
 		} else {
-			/* If elt->prev == NULL, elt was already detached/removed from the queue. */
-			if (elt->prev == NULL) {
-				return false;
-			}
 			remove_non_root(que, elt);
 			elt->next = elt->prev = NULL;
 			elt->child = 0;
