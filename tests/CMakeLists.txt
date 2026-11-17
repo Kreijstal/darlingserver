@@ -79,7 +79,7 @@ add_custom_command(
 	OUTPUT ${gen}/prefix_preinit.inc
 	COMMAND ${CMAKE_COMMAND} -E make_directory ${gen}
 	COMMAND sh -c "\"$@\" > \"$0\"" ${gen}/prefix_preinit.inc
-		${host}/extract-static.sh ${root}/src/darlingserver.cpp wipeDir darlingPreInit
+		${host}/extract-static.sh ${root}/src/darlingserver.cpp wipeDir ensureShSymlink relativizeNanobrewSymlinks createDir ensureHomebrewSymlinks darlingPreInit
 	DEPENDS ${host}/extract-static.sh ${root}/src/darlingserver.cpp
 	VERBATIM
 )
